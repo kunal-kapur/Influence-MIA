@@ -1,0 +1,40 @@
+#!/bin/bash
+#SBATCH -A gpu
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:1
+#SBATCH -t 02:00:00
+#SBATCH -o logs/%x-%j.out
+
+echo "Running on compute node:"
+echo $(hostname)
+echo "CUDA_VISIBLE_DEVICES is set to: $CUDA_VISIBLE_DEVICES"
+
+mkdir -p logs
+mkdir -p checkpoints
+
+# Train control model with 25% data
+# srun python train_control.py \
+#     --data-percentage 25 \
+#     --epochs 50 \
+#     --optimizer sgd \
+#     --lr 0.01 \
+#     --weight-decay 5e-4 \
+#     --scheduler cosine \
+#     --batch-size 128 \
+#     --seed 42 \
+#     --identifier 25pct_seed42 \
+#     --model-name model
+
+srun python train_control.py \
+    --data-percentage 10 \
+    --epochs 50 \
+    --optimizer sgd \
+    --lr 0.01 \
+    --weight-decay 0 \
+    --scheduler cosine \
+    --batch-size 128 \
+    --seed 42 \
+    --identifier 10pct_seed42_overfit \
+    --model-name model
+
+

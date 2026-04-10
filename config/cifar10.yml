@@ -1,0 +1,12 @@
+seed: 42
+model_type: resnet18
+data_dir: "/path/to/your/datasets"
+num_classes: 10
+data_mean: [0.4914, 0.4822, 0.4465]
+data_std:  [0.2023, 0.1994, 0.2010]
+lr: 0.1
+epochs: 100
+batch_size: 256
+pkeep: 0.5
+n_shadow_models: 10
+imitate_acc: 0.6        # kept for compatibility, not used in non-adaptive training

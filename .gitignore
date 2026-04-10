@@ -1,0 +1,7 @@
+.venv*
+__pycache__*
+checkpoints/*
+logs/*
+.vscode*
+attacks*
+archive*
