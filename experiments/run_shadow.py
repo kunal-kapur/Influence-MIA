@@ -25,8 +25,15 @@ from training.compute_influence import compute_influence
 
 
 def _load_config(dataset: str) -> types.SimpleNamespace:
-    """Load config/{dataset}.yml and return as a SimpleNamespace."""
-    config_path = os.path.join("config", f"{dataset}.yml")
+    """Load config/{dataset}.yaml (fallback to .yml) and return as a SimpleNamespace."""
+    config_dir = os.path.join("config")
+    yaml_path = os.path.join(config_dir, f"{dataset}.yaml")
+    yml_path = os.path.join(config_dir, f"{dataset}.yml")
+    config_path = yaml_path if os.path.exists(yaml_path) else yml_path
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(
+            f"Missing config for dataset '{dataset}' (expected {yaml_path} or {yml_path})."
+        )
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
     return types.SimpleNamespace(**cfg)
@@ -56,7 +63,7 @@ def _make_exp_name(args) -> str:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Shadow model training + influence computation")
     parser.add_argument("--dataset", type=str, default="cifar10",
-                        help="Dataset name (must match a config/<name>.yml file)")
+                        help="Dataset name (must match a config/<name>.yaml file)")
     parser.add_argument("--cuda", type=int, default=0,
                         help="CUDA device index (ignored if no GPU available)")
     parser.add_argument("--shadow_id", type=int, default=0,

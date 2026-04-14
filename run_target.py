@@ -24,7 +24,14 @@ def parse_args():
 
 
 def load_config(dataset):
-    config_path = Path(__file__).parent / "config" / f"{dataset}.yml"
+    config_dir = Path(__file__).parent / "config"
+    yaml_path = config_dir / f"{dataset}.yaml"
+    yml_path = config_dir / f"{dataset}.yml"
+    config_path = yaml_path if yaml_path.exists() else yml_path
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"Missing config for dataset '{dataset}' (expected {yaml_path} or {yml_path})."
+        )
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
     return Namespace(**cfg)

@@ -4,22 +4,19 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, Subset, ConcatDataset
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from data.loader import load_dataset, get_dataset
 from models.resnet import ResNet18_Influence
-from training.trainer import evaluate
+from training.trainer import evaluate, build_optimizer, build_scheduler
 from utils.io import save_model, load_model, save_array
 
 
 def _build_shared_pool(args):
-    """Concatenate target and shadow splits (~40,000 samples) with augmentation."""
+    """Return the shared pool (target/shadow) with augmentation."""
     get_dataset(args)  # sets args.data_mean, args.data_std, args.num_classes
-    target_split = load_dataset(args, data_type="target")
-    shadow_split = load_dataset(args, data_type="shadow")
-    return ConcatDataset([target_split, shadow_split])
+    return load_dataset(args, data_type="target")
 
 
 def _compute_in_mask(n_shadow_models, pool_size, pkeep, shadow_id):
@@ -42,7 +39,7 @@ def _save_checkpoint(out_dir, epoch, student, optimizer, scheduler,
         "epoch": epoch,
         "student_state": student.state_dict(),
         "optimizer_state": optimizer.state_dict(),
-        "scheduler_state": scheduler.state_dict(),
+        "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
         "best_val_acc": best_val_acc,
         "warmup_model_state": warmup_model.state_dict() if warmup_model is not None else None,
     }
@@ -57,7 +54,8 @@ def _load_checkpoint(ckpt_path, student, optimizer, scheduler, device, num_class
     ckpt = torch.load(ckpt_path, map_location=device)
     student.load_state_dict(ckpt["student_state"])
     optimizer.load_state_dict(ckpt["optimizer_state"])
-    scheduler.load_state_dict(ckpt["scheduler_state"])
+    if scheduler is not None and ckpt.get("scheduler_state") is not None:
+        scheduler.load_state_dict(ckpt["scheduler_state"])
     best_val_acc = ckpt["best_val_acc"]
 
     warmup_model = None
@@ -91,7 +89,7 @@ def train_shadow(args, shadow_id, device):
     warmup_path = os.path.join(out_dir, "warmup_model.pt")
     ckpt_path = os.path.join(out_dir, "checkpoint.pt")
 
-    # --- 1. Shared pool (~40,000 samples) ---
+    # --- 1. Shared pool ---
     shared_pool = _build_shared_pool(args)
     pool_size = len(shared_pool)
 
@@ -115,18 +113,19 @@ def train_shadow(args, shadow_id, device):
     train_ds = Subset(shared_pool, in_indices.tolist())
     val_ds = Subset(shared_pool, out_indices.tolist())
 
+    # Hyperparameters are configured in cifar10.yaml (lr, batch_size, optimizer, scheduler, dropout, num_workers, etc.)
     train_dl = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=args.num_workers,
         pin_memory=True,
     )
     val_dl = DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=args.num_workers,
         pin_memory=True,
     )
 
@@ -143,13 +142,9 @@ def train_shadow(args, shadow_id, device):
     # Fresh student
     student = ResNet18_Influence(num_classes=args.num_classes).to(device)
 
-    optimizer = optim.SGD(
-        student.parameters(),
-        lr=args.lr,
-        momentum=0.9,
-        weight_decay=5e-4,
-    )
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    # Hyperparameters are configured in cifar10.yaml (lr, batch_size, optimizer, scheduler, dropout, num_workers, etc.)
+    optimizer = build_optimizer(args, student.parameters())
+    scheduler = build_scheduler(args, optimizer)
 
     ce_criterion = nn.CrossEntropyLoss()
     mse_criterion = nn.MSELoss()
@@ -247,7 +242,8 @@ def train_shadow(args, shadow_id, device):
                 # doesn't lose the best weights seen so far
                 save_model(best_model, model_path)
 
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
 
         # Save epoch checkpoint (overwrites previous; atomic rename)
         _save_checkpoint(out_dir, epoch, student, optimizer, scheduler,

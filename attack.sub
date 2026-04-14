@@ -2,7 +2,7 @@
 #SBATCH -A gpu
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
-#SBATCH -t 48:00:00
+#SBATCH -t 4:00:00
 #SBATCH -o logs/%x-%j.out
 #SBATCH -J imia_attack
 
@@ -14,18 +14,15 @@ mkdir -p logs
 
 
 DATASET="cifar10"
-OUTPUT_DIR="outputs"
+OUTPUT_DIR="/scratch/scholar/kapur16/data/outputs/"
 CUDA=0
 
 # ---------------------------------------------------------------------------
 # Full pipeline: target model -> all shadow models -> influence computation
 # All hyperparameters are read from config/${DATASET}.yml at runtime.
 # Current defaults (cifar10.yml):
-#   epochs=100  lr=0.1  batch_size=256  seed=42
-#   warmup_epochs=20  temperature=4.0  margin_weight=2.0
-#   pkeep=0.5  n_shadow_models=10  imitate_acc=0.6
 # ---------------------------------------------------------------------------
-srun python -m experiments.run_experiment \
+srun --unbuffered python -u -m experiments.run_experiment \
     --dataset    ${DATASET} \
     --output_dir ${OUTPUT_DIR} \
     --cuda       ${CUDA}

@@ -31,7 +31,7 @@ from utils.io import load_model, load_array, save_array
 # ---------------------------------------------------------------------------
 
 def _build_shared_pool_no_aug(args):
-    """Load target + shadow splits with only normalisation (no random crops/flips)."""
+    """Load the shared pool (target/shadow) with only normalisation."""
     get_dataset(args)  # ensures data_mean / data_std / num_classes are set
     mean = args.data_mean
     std = args.data_std
@@ -48,10 +48,7 @@ def _build_shared_pool_no_aug(args):
         root=args.data_dir, train=False, download=True, transform=transform
     )
     full_dataset = ConcatDataset([train_ds, test_ds])
-
-    target_split = offline_data_split(full_dataset, args.seed, "target")
-    shadow_split = offline_data_split(full_dataset, args.seed, "shadow")
-    return ConcatDataset([target_split, shadow_split])
+    return offline_data_split(full_dataset, args.seed, "target")
 
 
 # ---------------------------------------------------------------------------
@@ -271,11 +268,12 @@ def compute_influence(args, shadow_id, device):
           f"OUT size: {pool_size - train_dataset_size}")
 
     # --- 3. Full-pool DataLoader (shuffle=False for deterministic ordering) ---
+    # Hyperparameters are configured in cifar10.yaml (lr, batch_size, optimizer, scheduler, dropout, num_workers, etc.)
     full_loader = DataLoader(
         shared_pool,
-        batch_size=512,
+        batch_size=args.batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=args.num_workers,
         pin_memory=True,
     )
 

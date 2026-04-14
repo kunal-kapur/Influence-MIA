@@ -14,22 +14,35 @@ def get_dataset(args):
 
 
 def offline_data_split(dataset, seed, data_type):
-    """Split dataset into 3 equal disjoint parts and return the one
-    corresponding to data_type ('target', 'shadow', or 'reference')."""
-    assert data_type in ("target", "shadow", "reference"), (
+    """
+    Split dataset into:
+      - shared pool for 'target' and 'shadow'
+      - small disjoint 'validation' split
+      - remaining disjoint 'reference' split
+    """
+    assert data_type in ("target", "shadow", "validation", "reference"), (
         f"Unknown data_type: {data_type}"
     )
 
     n = len(dataset)
-    part = n // 3
-    # Give any remainder to the last split so sizes sum to n
-    sizes = [part, part, n - 2 * part]
+
+    shared_size = n // 3          # e.g. 20,000 if n = 60,000
+    validation_size = n // 12     # e.g. 5,000 if n = 60,000
+    reference_size = n - shared_size - validation_size
 
     generator = torch.Generator().manual_seed(seed)
-    splits = random_split(dataset, sizes, generator=generator)
+    shared_split, validation_split, reference_split = random_split(
+        dataset,
+        [shared_size, validation_size, reference_size],
+        generator=generator,
+    )
 
-    idx = {"target": 0, "shadow": 1, "reference": 2}[data_type]
-    return splits[idx]
+    if data_type in ("target", "shadow"):
+        return shared_split
+    elif data_type == "validation":
+        return validation_split
+    else:  # reference
+        return reference_split
 
 
 def load_dataset(args, data_type="target"):

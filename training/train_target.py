@@ -25,18 +25,19 @@ def train_target(args, device):
     val_indices = np.array(val_ds.indices)
 
     # 3. DataLoaders
+    # Hyperparameters are configured in cifar10.yaml (lr, batch_size, optimizer, scheduler, dropout, num_workers, etc.)
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=args.num_workers,
         pin_memory=True,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=args.num_workers,
         pin_memory=True,
     )
 
