@@ -4,9 +4,8 @@ from torch.utils.data import DataLoader, random_split
 
 from data import load_dataset
 from models import ResNet18_Influence
-from training.trainer import train, evaluate
+from training.trainer import train
 from utils import save_model, save_array
-import torch.nn as nn
 
 
 def train_target(args, device):
@@ -32,6 +31,8 @@ def train_target(args, device):
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_ds,
@@ -39,6 +40,8 @@ def train_target(args, device):
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
 
     # 4. Model
@@ -59,7 +62,3 @@ def train_target(args, device):
     save_array(val_indices, val_idx_path)
     print(f"Indices saved to {train_idx_path} and {val_idx_path}")
 
-    # 8. Print final val accuracy
-    criterion = nn.CrossEntropyLoss()
-    _, final_val_acc = evaluate(model, val_loader, criterion, device)
-    print(f"Final val accuracy: {final_val_acc:.4f}")
