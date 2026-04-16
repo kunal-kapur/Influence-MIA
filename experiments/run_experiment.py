@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from training.train_target import train_target
 from training.train_shadow import train_shadow
 from training.compute_influence import compute_influence
+from experiments.analyze import run as run_analysis
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +188,13 @@ def main() -> None:
                 torch.cuda.empty_cache()
     else:
         print("[shadows] --skip_shadows set — skipping shadow training.")
+
+    # --- Stage 3: influence vs LiRA bucketing analysis ---
+    # Skip when --skip_shadows is set or when only a single shadow was run
+    # (partial run — not all shadows are necessarily complete yet).
+    if not cli.skip_shadows and cli.shadow_id is None:
+        print(f"\n{'='*60}\nStage 3: Influence vs LiRA analysis\n{'='*60}")
+        run_analysis(exp_dir=args.exp_dir, dataset=cli.dataset)
 
     print("\nAll done.")
 

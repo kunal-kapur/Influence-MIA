@@ -25,8 +25,8 @@ fi
 
 # ---------------------------------------------------------------------------
 # Full pipeline: target model -> all shadow models -> influence computation
+#                -> influence vs LiRA bucketing analysis
 # All hyperparameters are read from config/${DATASET}.yml at runtime.
-# Current defaults (cifar10.yml):
 # To resume after a crash: resubmit this script unchanged.
 # ---------------------------------------------------------------------------
 srun --unbuffered python -u -m experiments.run_experiment \
