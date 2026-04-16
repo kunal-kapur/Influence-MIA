@@ -71,71 +71,57 @@ def _extract_features(model, x):
 
 
 def _compute_last_layer_hessian(model, loader, device, damping=1e-4):
-    """Exact empirical Fisher Hessian of the CE loss w.r.t. the last linear
-    layer (weights + bias), using augmented features [phi, 1].
+    """Exact empirical Fisher Hessian on GPU in float32 using einsum, matching
+    the alternate implementation's approach for memory efficiency.
 
-    H = (1/N) * sum_i  kron(phi_aug_i phi_aug_i^T, P_cov_i)  +  damping * I
+    H = (1/N) * sum_i  einsum(P_cov_i, phi_aug_i, phi_aug_i)  +  damping * I
 
-    where P_cov_i = diag(p_i) - p_i p_i^T is the correct curvature block for
-    softmax + CE. D = (F+1) * C.
+    Accumulates H on GPU in float32; D = (F+1)*C = 5130.
 
-    Returns: H_inv  (numpy array, shape [D, D])
+    Returns: H_inv  (torch.Tensor float32 on device, shape [D, D])
     """
     model.eval()
+    num_classes = model.linear.out_features
+    num_features = model.linear.in_features + 1  # +1 for bias
+    D = num_classes * num_features
 
-    last_linear = model.linear
-    in_features = last_linear.in_features + 1  # +1 for bias
-    num_classes = last_linear.out_features
-    D = in_features * num_classes
-
-    H = torch.zeros(D, D, dtype=torch.float64)
+    H = torch.zeros(D, D, device=device, dtype=torch.float32)
     N = 0
 
     with torch.no_grad():
         for x, y in loader:
-            x, y = x.to(device), y.to(device)
+            x = x.to(device)
             bs = x.size(0)
 
-            phi_aug = _extract_features(model, x)  # (bs, F+1)
+            phi_aug = _extract_features(model, x)           # (bs, F+1)
             logits = phi_aug[:, :-1] @ model.linear.weight.T + model.linear.bias
-            probs = torch.softmax(logits, dim=1)  # (bs, C)
+            probs = torch.softmax(logits, dim=1)             # (bs, C)
 
-            # Per-sample gradient via kron(phi_aug, p - e_y): shape (bs, D)
-            residual = probs.clone()
-            residual[torch.arange(bs), y] -= 1.0
-            grad = torch.bmm(
-                residual.unsqueeze(2),    # (bs, C, 1)
-                phi_aug.unsqueeze(1),     # (bs, 1, F+1)
-            ).reshape(bs, D)
-
-            grad_cpu = grad.double().cpu()
-            H += grad_cpu.T @ grad_cpu
+            # Exact curvature: P_cov = diag(p) - p p^T
+            P_cov = torch.diag_embed(probs) - torch.einsum('bi,bj->bij', probs, probs)  # (bs, C, C)
+            H += torch.einsum('bij,bk,bl->ikjl', P_cov, phi_aug, phi_aug).reshape(D, D)
             N += bs
 
     H /= N
-    H += damping * torch.eye(D, dtype=torch.float64)
-    H_inv = torch.linalg.inv(H).numpy()
-    return H_inv
+    H += damping * torch.eye(D, device=device, dtype=torch.float32)
+    return torch.linalg.inv(H)  # (D, D) float32 on device
 
 
 # ---------------------------------------------------------------------------
 # Influence matrices
 # ---------------------------------------------------------------------------
 
-def _compute_all_gradients(model, loader, train_dataset_size, device):
-    """Compute per-sample gradients of CE loss and LiRA statistic for every
-    point in `loader`, using augmented features [phi, 1] (bias-aware).
+def _collect_gradients(model, loader, train_dataset_size, device):
+    """Collect per-sample CE and LiRA gradients on GPU in float32.
 
-    LiRA gradient uses the sign-corrected formula:
-        d(t)/d(logits) = (p - e_y) / (p_true - 1.0)
-    which divides by (p_true - 1) < 0, matching the proper sign convention.
+    LiRA gradient: (p - e_y) / (p_true - 1)  — sign-correct convention.
 
-    Returns: (G_lira, G_loss)  both (N, D) numpy arrays.
+    Returns: (G_lira, G_loss)  both (N, D) float32 tensors on device.
     """
     model.eval()
-    in_features = model.linear.in_features + 1  # +1 for bias
     num_classes = model.linear.out_features
-    D = in_features * num_classes
+    num_features = model.linear.in_features + 1
+    D = num_classes * num_features
 
     G_lira_list = []
     G_loss_list = []
@@ -145,64 +131,47 @@ def _compute_all_gradients(model, loader, train_dataset_size, device):
             x, y = x.to(device), y.to(device)
             bs = x.size(0)
 
-            phi_aug = _extract_features(model, x)  # (bs, F+1)
+            phi_aug = _extract_features(model, x)            # (bs, F+1)
             logits = phi_aug[:, :-1] @ model.linear.weight.T + model.linear.bias
-            probs = torch.softmax(logits, dim=1)  # (bs, C)
+            probs = torch.softmax(logits, dim=1)              # (bs, C)
 
-            p_true = probs.gather(1, y.unsqueeze(1)).squeeze(1)  # (bs,)
-            p_true = torch.clamp(p_true, 1e-7, 1.0 - 1e-7)
+            p_true = probs.gather(1, y.unsqueeze(1)).clamp(1e-7, 1.0 - 1e-7)  # (bs, 1)
 
-            # CE loss gradient: (p - e_y) ⊗ phi_aug
-            residual_loss = probs.clone()
-            residual_loss[torch.arange(bs), y] -= 1.0
-            grad_loss = torch.bmm(
-                residual_loss.unsqueeze(2),
-                phi_aug.unsqueeze(1),
-            ).reshape(bs, D).double().cpu() / train_dataset_size
+            y_onehot = F.one_hot(y, num_classes=num_classes).float()
+            d_logits = probs - y_onehot                       # (bs, C)  CE gradient
+            d_logits_lira = d_logits / (p_true - 1.0)        # (bs, C)  LiRA gradient
 
-            # LiRA gradient: (p - e_y) / (p_true - 1) ⊗ phi_aug
-            # (p_true - 1) is always negative, which flips the sign correctly
-            residual_lira = residual_loss / (p_true - 1.0).unsqueeze(1)
-            grad_lira = torch.bmm(
-                residual_lira.unsqueeze(2),
-                phi_aug.unsqueeze(1),
-            ).reshape(bs, D).double().cpu() / train_dataset_size
+            G_loss_list.append(torch.einsum('nc,nf->ncf', d_logits,      phi_aug).reshape(bs, D))
+            G_lira_list.append(torch.einsum('nc,nf->ncf', d_logits_lira, phi_aug).reshape(bs, D))
 
-            G_lira_list.append(grad_lira.numpy())
-            G_loss_list.append(grad_loss.numpy())
-
-    return np.concatenate(G_lira_list, axis=0), np.concatenate(G_loss_list, axis=0)
+    G_loss = torch.cat(G_loss_list, dim=0) / train_dataset_size  # (N, D)
+    G_lira = torch.cat(G_lira_list, dim=0) / train_dataset_size  # (N, D)
+    return G_lira, G_loss
 
 
 def _compute_influence_matrices(model, loader, H_inv, train_dataset_size, device):
-    """Compute the full N×N cross-influence matrix and return column norms.
+    """Compute the full N×N cross-influence matrices on GPU in float32, then
+    return column norms as the per-point vulnerability scores.
 
-    C_lira[j] = ||column j of (-G_lira @ H_inv @ G_loss^T / N)||
-              = vulnerability score for training point j, measuring how
-                much removing j shifts the LiRA statistic across all N points.
+    C_lira = -(G_lira @ H_inv @ G_loss^T) / N   →  column norms  (N,)
+    C_loss = -(G_loss @ H_inv @ G_loss^T) / N   →  column norms  (N,)
 
-    C_loss[j] is the same but using G_loss for both sides.
+    At N=20k and D=5130, the (D,N) intermediate is ~400 MB float32 and the
+    full (N,N) matrix is ~1.5 GB float32 — fits comfortably on an A10 GPU.
 
-    Returns: (C_lira, C_loss)  both 1-D numpy arrays of length N (column norms).
+    Returns: (C_lira, C_loss)  both 1-D numpy arrays of length N.
     """
-    G_lira, G_loss = _compute_all_gradients(model, loader, train_dataset_size, device)
-    # G_lira, G_loss: (N, D)
-
-    H_inv_np = np.array(H_inv, dtype=np.float64)
-
-    # H_inv @ G^T  ->  (D, N)
-    HinvGloss_T = H_inv_np @ G_loss.T   # (D, N)
-    HinvGlira_T = H_inv_np @ G_lira.T   # (D, N)
-
-    # Cross-influence matrices: (N, N)
-    # C_lira_mat[i, j] = -G_lira[i] @ H_inv @ G_loss[j] / N
+    G_lira, G_loss = _collect_gradients(model, loader, train_dataset_size, device)
     N = G_lira.shape[0]
-    C_lira_mat = -(G_lira @ HinvGloss_T) / N   # (N, N)
-    C_loss_mat = -(G_loss @ HinvGloss_T) / N   # (N, N)
 
-    # Column norms: vulnerability score per training point j
-    C_lira = np.linalg.norm(C_lira_mat, axis=0)  # (N,)
-    C_loss = np.linalg.norm(C_loss_mat, axis=0)  # (N,)
+    # H_inv @ G_loss^T: reuse for both matrices  (D, N)
+    H_inv_Gl_T = H_inv @ G_loss.T
+
+    C_lira_mat = -(G_lira @ H_inv_Gl_T) / N   # (N, N)
+    C_loss_mat = -(G_loss @ H_inv_Gl_T) / N   # (N, N)
+
+    C_lira = torch.linalg.norm(C_lira_mat, dim=0).cpu().numpy()  # (N,)
+    C_loss = torch.linalg.norm(C_loss_mat, dim=0).cpu().numpy()  # (N,)
 
     return C_lira, C_loss
 
@@ -280,14 +249,31 @@ def compute_influence(args, shadow_id, device):
     model.eval()
     print(f"[shadow {shadow_id}] Model loaded from {model_path}")
 
-    # --- 5. Hessian ---
+    # --- 5. Hessian (subsample IN points, keep H_inv on GPU as float32) ---
+    expected_D = (model.linear.in_features + 1) * model.linear.out_features
+    H_inv = None
     if os.path.exists(hinv_path):
-        print(f"[shadow {shadow_id}] H_inv already exists, loading...")
-        H_inv = load_array(hinv_path)
-    else:
-        print(f"[shadow {shadow_id}] Computing Hessian...")
-        H_inv = _compute_last_layer_hessian(model, full_loader, device, damping=1e-4)
-        save_array(H_inv, hinv_path)
+        cached = load_array(hinv_path)
+        if cached.shape != (expected_D, expected_D):
+            print(f"[shadow {shadow_id}] H_inv shape {cached.shape} != expected "
+                  f"({expected_D},{expected_D}) — recomputing.")
+        else:
+            print(f"[shadow {shadow_id}] H_inv already exists, loading...")
+            H_inv = torch.tensor(cached, dtype=torch.float32, device=device)
+    if H_inv is None:
+        hessian_sample = min(3000, train_dataset_size)
+        in_indices = np.where(in_mask)[0]
+        hessian_indices = np.random.choice(in_indices, hessian_sample, replace=False).tolist()
+        hessian_loader = DataLoader(
+            Subset(shared_pool, hessian_indices),
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
+        print(f"[shadow {shadow_id}] Computing Hessian on {hessian_sample} IN samples...")
+        H_inv = _compute_last_layer_hessian(model, hessian_loader, device, damping=1e-4)
+        save_array(H_inv.cpu().numpy(), hinv_path)
         print(f"[shadow {shadow_id}] H_inv saved to {hinv_path}  shape={H_inv.shape}")
 
     # --- 6. Influence matrices ---
