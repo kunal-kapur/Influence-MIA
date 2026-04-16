@@ -399,9 +399,8 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
 
     has_closs = all(c is not None for c in C_loss_list)
     scores_C_loss = _aggregate_influence(C_loss_list, in_masks) if has_closs else None
-    scores_grad = np.abs(scores_C_lira)
 
-    scores_dict = {"C_lira": scores_C_lira, "grad_norm": scores_grad}
+    scores_dict = {"C_lira": scores_C_lira}
     if scores_C_loss is not None:
         scores_dict["C_loss"] = scores_C_loss
 
@@ -414,7 +413,6 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
         lira_scores=lira_scores,
         ground_truth=ground_truth.astype(np.int32),
         scores_C_lira=scores_C_lira,
-        scores_grad=scores_grad,
     )
     if scores_C_loss is not None:
         save_dict["scores_C_loss"] = scores_C_loss

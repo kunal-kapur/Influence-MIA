@@ -2,14 +2,14 @@
 
 The Hessian and influence computations are over the *last linear layer* only,
 treating the penultimate feature vector as a fixed representation.  This keeps
-the Hessian size manageable (512×512 for ResNet18) while remaining a valid
-local approximation of influence.
+the Hessian size manageable (513×513 for ResNet18 with bias) while remaining a
+valid local approximation of influence.
 
 Outputs (per shadow_id)
 -----------------------
 outputs/{dataset}/shadows/{shadow_id}/H_inv.npy      — inverse Hessian  (D×D)
-outputs/{dataset}/shadows/{shadow_id}/C_lira.npy     — LiRA influence   (N,)
-outputs/{dataset}/shadows/{shadow_id}/C_loss.npy     — loss influence   (N,)
+outputs/{dataset}/shadows/{shadow_id}/C_lira.npy     — LiRA influence   (N,)  column norms of N×N matrix
+outputs/{dataset}/shadows/{shadow_id}/C_loss.npy     — loss influence   (N,)  column norms of N×N matrix
 outputs/{dataset}/shadows/{shadow_id}/lira_stats.npy — scaled logits    (N,)
 """
 
@@ -56,27 +56,35 @@ def _build_shared_pool_no_aug(args):
 # Last-layer Hessian
 # ---------------------------------------------------------------------------
 
+def _extract_features(model, x):
+    """Return augmented features [phi, 1] for the last linear layer (bias-aware)."""
+    bs = x.size(0)
+    out = F.relu(model.bn1(model.conv1(x)))
+    out = model.layer1(out)
+    out = model.layer2(out)
+    out = model.layer3(out)
+    out = model.layer4(out)
+    out = F.avg_pool2d(out, 4)
+    phi = out.view(bs, -1)  # (bs, F)
+    ones = torch.ones(bs, 1, device=x.device, dtype=phi.dtype)
+    return torch.cat([phi, ones], dim=1)  # (bs, F+1)
+
+
 def _compute_last_layer_hessian(model, loader, device, damping=1e-4):
-    """Gauss-Newton / empirical Fisher Hessian of the CE loss w.r.t. the last
-    linear layer weights, accumulated over all batches.
+    """Exact empirical Fisher Hessian of the CE loss w.r.t. the last linear
+    layer (weights + bias), using augmented features [phi, 1].
 
-    H = (1/N) * sum_i  J_i^T J_i  +  damping * I
+    H = (1/N) * sum_i  kron(phi_aug_i phi_aug_i^T, P_cov_i)  +  damping * I
 
-    where J_i is the Jacobian of the per-sample CE loss w.r.t. the last layer
-    weight matrix, flattened to a vector.
+    where P_cov_i = diag(p_i) - p_i p_i^T is the correct curvature block for
+    softmax + CE. D = (F+1) * C.
 
-    For a linear layer  out = phi @ W^T  (no bias for simplicity, or bias
-    absorbed), the per-sample gradient is  kron(phi_i, (p_i - e_{y_i})).
-    The Gauss-Newton approximation gives H as the empirical covariance of
-    these gradients.
-
-    Returns: H_inv  (torch.Tensor, shape [D, D])  where D = in_features * num_classes
+    Returns: H_inv  (numpy array, shape [D, D])
     """
     model.eval()
 
-    # Identify the last linear layer and its dimensions
     last_linear = model.linear
-    in_features = last_linear.in_features
+    in_features = last_linear.in_features + 1  # +1 for bias
     num_classes = last_linear.out_features
     D = in_features * num_classes
 
@@ -88,128 +96,115 @@ def _compute_last_layer_hessian(model, loader, device, damping=1e-4):
             x, y = x.to(device), y.to(device)
             bs = x.size(0)
 
-            # Forward pass up to penultimate layer (feature extractor)
-            out = F.relu(model.bn1(model.conv1(x)))
-            out = model.layer1(out)
-            out = model.layer2(out)
-            out = model.layer3(out)
-            out = model.layer4(out)
-            out = F.avg_pool2d(out, 4)
-            phi = out.view(bs, -1)  # (bs, in_features)
-
-            # Softmax probabilities
-            logits = model.linear(phi)
+            phi_aug = _extract_features(model, x)  # (bs, F+1)
+            logits = phi_aug[:, :-1] @ model.linear.weight.T + model.linear.bias
             probs = torch.softmax(logits, dim=1)  # (bs, C)
 
-            # Residual: p - e_y
+            # Per-sample gradient via kron(phi_aug, p - e_y): shape (bs, D)
             residual = probs.clone()
-            residual[torch.arange(bs), y] -= 1.0  # (bs, C)
-
-            # Per-sample gradient (flattened): kron(phi_i, residual_i)
-            # Shape: (bs, C, in_features) -> (bs, D)
+            residual[torch.arange(bs), y] -= 1.0
             grad = torch.bmm(
-                residual.unsqueeze(2),   # (bs, C, 1)
-                phi.unsqueeze(1),        # (bs, 1, in_features)
-            ).reshape(bs, D)             # (bs, D)
+                residual.unsqueeze(2),    # (bs, C, 1)
+                phi_aug.unsqueeze(1),     # (bs, 1, F+1)
+            ).reshape(bs, D)
 
-            # Accumulate outer products (move to CPU to keep memory on GPU low)
             grad_cpu = grad.double().cpu()
             H += grad_cpu.T @ grad_cpu
             N += bs
 
     H /= N
     H += damping * torch.eye(D, dtype=torch.float64)
-    return H
+    H_inv = torch.linalg.inv(H).numpy()
+    return H_inv
 
 
 # ---------------------------------------------------------------------------
 # Influence matrices
 # ---------------------------------------------------------------------------
 
-def _compute_influence_matrices(model, loader, H_inv, train_dataset_size, device):
-    """Compute per-sample influence scores for every point in `loader`.
+def _compute_all_gradients(model, loader, train_dataset_size, device):
+    """Compute per-sample gradients of CE loss and LiRA statistic for every
+    point in `loader`, using augmented features [phi, 1] (bias-aware).
 
-    Two variants:
-      C_lira[i]  — influence on the *scaled-logit* (LiRA statistic) of sample i
-                   when sample i is removed from the training set.
-      C_loss[i]  — influence on the *CE loss* of sample i.
+    LiRA gradient uses the sign-corrected formula:
+        d(t)/d(logits) = (p - e_y) / (p_true - 1.0)
+    which divides by (p_true - 1) < 0, matching the proper sign convention.
 
-    Both use the standard influence-function formula:
-        I(z, z_test) = -grad_test^T H^{-1} grad_train
-
-    Here we take the self-influence (z == z_test) approximation which is the
-    quantity used in MIA: "how much does removing point i affect the model's
-    behaviour on point i itself?"
-
-    Returns: (C_lira, C_loss)  both 1-D numpy arrays of length N.
+    Returns: (G_lira, G_loss)  both (N, D) numpy arrays.
     """
     model.eval()
-    last_linear = model.linear
-    in_features = last_linear.in_features
-    num_classes = last_linear.out_features
+    in_features = model.linear.in_features + 1  # +1 for bias
+    num_classes = model.linear.out_features
     D = in_features * num_classes
 
-    H_inv_t = torch.tensor(H_inv, dtype=torch.float64)  # (D, D) on CPU
-
-    C_lira_list = []
-    C_loss_list = []
+    G_lira_list = []
+    G_loss_list = []
 
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(device), y.to(device)
             bs = x.size(0)
 
-            # Feature extraction
-            out = F.relu(model.bn1(model.conv1(x)))
-            out = model.layer1(out)
-            out = model.layer2(out)
-            out = model.layer3(out)
-            out = model.layer4(out)
-            out = F.avg_pool2d(out, 4)
-            phi = out.view(bs, -1)  # (bs, F)
-
-            logits = model.linear(phi)
+            phi_aug = _extract_features(model, x)  # (bs, F+1)
+            logits = phi_aug[:, :-1] @ model.linear.weight.T + model.linear.bias
             probs = torch.softmax(logits, dim=1)  # (bs, C)
 
-            # --- Gradient of CE loss w.r.t. last-layer weights ---
-            residual_loss = probs.clone()
-            residual_loss[torch.arange(bs), y] -= 1.0
-            # Scale by 1/N_train as in the paper convention
-            grad_loss = torch.bmm(
-                residual_loss.unsqueeze(2),
-                phi.unsqueeze(1),
-            ).reshape(bs, D).double().cpu() / train_dataset_size  # (bs, D)
-
-            # --- Gradient of LiRA scaled-logit w.r.t. last-layer weights ---
-            # scaled logit t_i = log(p_{y_i} / (1 - p_{y_i}))
-            # dt/dp_{y_i} = 1 / (p_{y_i} * (1 - p_{y_i}))
             p_true = probs.gather(1, y.unsqueeze(1)).squeeze(1)  # (bs,)
             p_true = torch.clamp(p_true, 1e-7, 1.0 - 1e-7)
-            dt_dp = 1.0 / (p_true * (1.0 - p_true))  # (bs,)
 
-            # dp_{y_i}/dlogits = p_{y_i}*(delta_{k,y_i} - p_k)
-            # d(lira)/d(logit_k) = dt_dp * p_{y_i} * (delta_{k,y_i} - p_k)
-            residual_lira = -p_true.unsqueeze(1) * probs.clone()  # (bs, C)
-            residual_lira[torch.arange(bs), y] += p_true          # add p_{y_i}
-            residual_lira = residual_lira * (dt_dp * p_true).unsqueeze(1)
+            # CE loss gradient: (p - e_y) ⊗ phi_aug
+            residual_loss = probs.clone()
+            residual_loss[torch.arange(bs), y] -= 1.0
+            grad_loss = torch.bmm(
+                residual_loss.unsqueeze(2),
+                phi_aug.unsqueeze(1),
+            ).reshape(bs, D).double().cpu() / train_dataset_size
 
+            # LiRA gradient: (p - e_y) / (p_true - 1) ⊗ phi_aug
+            # (p_true - 1) is always negative, which flips the sign correctly
+            residual_lira = residual_loss / (p_true - 1.0).unsqueeze(1)
             grad_lira = torch.bmm(
                 residual_lira.unsqueeze(2),
-                phi.unsqueeze(1),
-            ).reshape(bs, D).double().cpu() / train_dataset_size  # (bs, D)
+                phi_aug.unsqueeze(1),
+            ).reshape(bs, D).double().cpu() / train_dataset_size
 
-            # --- Self-influence: -g_test^T H^{-1} g_train ---
-            # Here g_test == g_train (self-influence)
-            Hinv_g_loss = grad_loss @ H_inv_t.T   # (bs, D)
-            Hinv_g_lira = grad_lira @ H_inv_t.T   # (bs, D)
+            G_lira_list.append(grad_lira.numpy())
+            G_loss_list.append(grad_loss.numpy())
 
-            c_loss = -(grad_loss * Hinv_g_loss).sum(dim=1)   # (bs,)
-            c_lira = -(grad_lira * Hinv_g_lira).sum(dim=1)   # (bs,)
+    return np.concatenate(G_lira_list, axis=0), np.concatenate(G_loss_list, axis=0)
 
-            C_lira_list.append(c_lira.numpy())
-            C_loss_list.append(c_loss.numpy())
 
-    return np.concatenate(C_lira_list), np.concatenate(C_loss_list)
+def _compute_influence_matrices(model, loader, H_inv, train_dataset_size, device):
+    """Compute the full N×N cross-influence matrix and return column norms.
+
+    C_lira[j] = ||column j of (-G_lira @ H_inv @ G_loss^T / N)||
+              = vulnerability score for training point j, measuring how
+                much removing j shifts the LiRA statistic across all N points.
+
+    C_loss[j] is the same but using G_loss for both sides.
+
+    Returns: (C_lira, C_loss)  both 1-D numpy arrays of length N (column norms).
+    """
+    G_lira, G_loss = _compute_all_gradients(model, loader, train_dataset_size, device)
+    # G_lira, G_loss: (N, D)
+
+    H_inv_np = np.array(H_inv, dtype=np.float64)
+
+    # H_inv @ G^T  ->  (D, N)
+    HinvGloss_T = H_inv_np @ G_loss.T   # (D, N)
+    HinvGlira_T = H_inv_np @ G_lira.T   # (D, N)
+
+    # Cross-influence matrices: (N, N)
+    # C_lira_mat[i, j] = -G_lira[i] @ H_inv @ G_loss[j] / N
+    N = G_lira.shape[0]
+    C_lira_mat = -(G_lira @ HinvGloss_T) / N   # (N, N)
+    C_loss_mat = -(G_loss @ HinvGloss_T) / N   # (N, N)
+
+    # Column norms: vulnerability score per training point j
+    C_lira = np.linalg.norm(C_lira_mat, axis=0)  # (N,)
+    C_loss = np.linalg.norm(C_loss_mat, axis=0)  # (N,)
+
+    return C_lira, C_loss
 
 
 # ---------------------------------------------------------------------------
@@ -291,11 +286,9 @@ def compute_influence(args, shadow_id, device):
         H_inv = load_array(hinv_path)
     else:
         print(f"[shadow {shadow_id}] Computing Hessian...")
-        H = _compute_last_layer_hessian(model, full_loader, device, damping=1e-4)
-        print(f"[shadow {shadow_id}] Inverting Hessian ({H.shape[0]}×{H.shape[1]})...")
-        H_inv = torch.linalg.inv(H).numpy()
+        H_inv = _compute_last_layer_hessian(model, full_loader, device, damping=1e-4)
         save_array(H_inv, hinv_path)
-        print(f"[shadow {shadow_id}] H_inv saved to {hinv_path}")
+        print(f"[shadow {shadow_id}] H_inv saved to {hinv_path}  shape={H_inv.shape}")
 
     # --- 6. Influence matrices ---
     if os.path.exists(clira_path) and os.path.exists(closs_path):
