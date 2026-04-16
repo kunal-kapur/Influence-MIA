@@ -106,6 +106,8 @@ def _parse_args() -> argparse.Namespace:
                         help="Skip target model training (use existing checkpoint)")
     parser.add_argument("--skip_shadows", action="store_true",
                         help="Skip shadow training + influence (target only)")
+    parser.add_argument("--num_buckets", type=int, default=10,
+                        help="Number of quantile buckets for Stage 3 analysis")
     return parser.parse_args()
 
 
@@ -194,7 +196,7 @@ def main() -> None:
     # (partial run — not all shadows are necessarily complete yet).
     if not cli.skip_shadows and cli.shadow_id is None:
         print(f"\n{'='*60}\nStage 3: Influence vs LiRA analysis\n{'='*60}")
-        run_analysis(exp_dir=args.exp_dir, dataset=cli.dataset)
+        run_analysis(exp_dir=args.exp_dir, dataset=cli.dataset, num_buckets=cli.num_buckets)
 
     print("\nAll done.")
 

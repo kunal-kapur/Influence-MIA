@@ -1,15 +1,18 @@
 """Post-hoc analysis: influence scores vs LiRA vulnerability bucketing.
 
-Index alignment
----------------
-All per-point arrays are aligned to query_indices.npy (written by train_target):
+For each query point we have, across K shadow models:
+  - lira_stats[k][i]  : scaled logit  t_i  for shadow k  (N,)
+  - C_lira[k][i]      : influence on LiRA statistic        (N,)
+  - C_loss[k][i]      : influence on CE loss                (N,)
+  - in_mask[k][i]     : 1 if point i was IN shadow k's training set
 
-  query_indices[i]   — pool-relative index of the i-th query point
-  ground_truth[i]    — 1 if query point i is a member of D_train, else 0
-  lira_stats[k][i]   — shadow k's scaled logit for query point i
-  C_lira[k][i]       — shadow k's LiRA influence score for query point i
-  in_mask[k][i]      — 1 if query point i has a synthetic IN label for shadow k
-  target_scores[i]   — target model's scaled logit for query point i
+The LiRA log-likelihood ratio for point i is:
+    lira_score[i] = log p(t_i | IN) - log p(t_i | OUT)
+
+We approximate IN/OUT distributions per-point from the shadow statistics,
+then bucket points by each influence score and compute:
+  - Pearson correlation with lira_score
+    - TPR @ 0% FPR, TPR @ 0.1% FPR, TPR @ 1% FPR, and Balanced Accuracy per bucket
 
 Usage
 -----
@@ -338,24 +341,26 @@ def _plot_score_vs_lira(score_name, scores, lira_scores, ground_truth, out_dir):
 # Core analysis
 # ---------------------------------------------------------------------------
 
-def analyze_score(score_name, scores, lira_scores, ground_truth, out_dir, num_buckets=5):
+def analyze_score(score_name, scores, lira_scores, ground_truth, out_dir, num_buckets=10):
     corr = np.corrcoef(scores, lira_scores)[0, 1]
     print(f"\n  [{score_name}] Pearson corr(score, LiRA log-LR): {corr:.3f}")
 
     quantiles  = np.quantile(scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
     bucket_ids = np.digitize(scores, quantiles)
 
-    print(f"  [{score_name}] Bucketed TPR@0.1%FPR, TPR@1%FPR and Balanced Acc by quintile:")
+    print(f"  [{score_name}] Bucketed TPR@0%FPR, TPR@0.1%FPR, TPR@1%FPR and Balanced Acc by quintile:")
     for b in range(num_buckets):
         idx = np.where(bucket_ids == b)[0]
         if len(idx) < 10:
             print(f"    Bucket {b}: too few points ({len(idx)}), skipping")
             continue
         fpr, tpr, _ = roc_curve(ground_truth[idx], lira_scores[idx])
+        tpr_0pct = _tpr_at_fpr(fpr, tpr, max_fpr=0.0)
         tpr_01pct = _tpr_at_fpr(fpr, tpr, max_fpr=0.001)
         tpr_1pct  = _tpr_at_fpr(fpr, tpr, max_fpr=0.01)
         bal_acc   = _balanced_accuracy_from_roc(fpr, tpr)
         print(f"    Bucket {b}: size={len(idx):4d}, "
+              f"TPR@0%FPR={tpr_0pct*100:5.2f}%, "
               f"TPR@0.1%FPR={tpr_01pct*100:5.2f}%, "
               f"TPR@1%FPR={tpr_1pct*100:5.2f}%, "
               f"Balanced Acc={bal_acc*100:5.2f}%")
@@ -373,8 +378,8 @@ def _parse_args():
     parser.add_argument("--dataset",     default="cifar10")
     parser.add_argument("--exp_dir",     required=True,
                         help="Experiment directory (e.g. outputs/<exp>/cifar10)")
-    parser.add_argument("--num_buckets", type=int, default=5,
-                        help="Number of quantile buckets (default: 5)")
+    parser.add_argument("--num_buckets", type=int, default=10,
+                        help="Number of quantile buckets (default: 5 = quintiles)")
     return parser.parse_args()
 
 
@@ -428,12 +433,14 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
     print("\nComputing LiRA log-LR scores...")
     lira_scores = _compute_lira_scores(lira_stats, in_masks, target_scores)
 
-    fpr_all, tpr_all, _ = roc_curve(ground_truth, lira_scores)
-    tpr_01pct = _tpr_at_fpr(fpr_all, tpr_all, max_fpr=0.001)
-    tpr_1pct  = _tpr_at_fpr(fpr_all, tpr_all, max_fpr=0.01)
-    bal_acc   = _balanced_accuracy_from_roc(fpr_all, tpr_all)
-    print(f"  LiRA global: TPR@0.1%FPR={tpr_01pct*100:.2f}%, "
-          f"TPR@1%FPR={tpr_1pct*100:.2f}%, Balanced Acc={bal_acc*100:.2f}%")
+    fpr_all, tpr_all, _ = roc_curve(ground_truth.astype(int), lira_scores)
+    tpr_0pct_all = _tpr_at_fpr(fpr_all, tpr_all, max_fpr=0.0)
+    tpr_01pct_all = _tpr_at_fpr(fpr_all, tpr_all, max_fpr=0.001)
+    tpr_1pct_all = _tpr_at_fpr(fpr_all, tpr_all, max_fpr=0.01)
+    bal_acc_all = _balanced_accuracy_from_roc(fpr_all, tpr_all)
+    print(f"  LiRA global: TPR@0%FPR={tpr_0pct_all*100:.2f}%, "
+          f"TPR@0.1%FPR={tpr_01pct_all*100:.2f}%, "
+          f"TPR@1%FPR={tpr_1pct_all*100:.2f}%, Balanced Acc={bal_acc_all*100:.2f}%")
 
     # ------------------------------------------------------------------
     # 5. Influence scores
@@ -471,10 +478,10 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
     print(f"\n{'='*60}")
     print("RESULTS")
     print(f"{'='*60}")
-    print(f"  Query set : {n_query} points  ({members} members + {nonmembers} non-members)")
-    print(f"  LiRA: TPR@0.1%FPR={tpr_01pct*100:.2f}%  "
-          f"TPR@1%FPR={tpr_1pct*100:.2f}%  "
-          f"Balanced Acc={bal_acc*100:.2f}%")
+    print(f"  LiRA: TPR@0%FPR={tpr_0pct_all*100:.2f}%  "
+          f"TPR@0.1%FPR={tpr_01pct_all*100:.2f}%  "
+          f"TPR@1%FPR={tpr_1pct_all*100:.2f}%  "
+          f"Balanced Acc={bal_acc_all*100:.2f}%")
     print(f"{'='*60}\n")
 
 

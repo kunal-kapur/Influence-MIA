@@ -33,4 +33,5 @@ srun --unbuffered python -u -m experiments.run_experiment \
     --dataset    ${DATASET} \
     --output_dir ${OUTPUT_DIR} \
     --cuda       ${CUDA} \
-    --exp_name   ${EXP_NAME}
+    --exp_name   ${EXP_NAME} \
+    --num_buckets 10
