@@ -30,9 +30,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
+import torchvision
+import torchvision.transforms as transforms
 import yaml
 from scipy.stats import norm
 from sklearn.metrics import roc_curve
+from torch.utils.data import ConcatDataset, DataLoader, Subset
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -89,40 +93,105 @@ def _load_target_membership(exp_dir: str, pool_size: int):
 
 
 # ---------------------------------------------------------------------------
+# Target model evaluation
+# ---------------------------------------------------------------------------
+
+def _compute_target_lira_scores(exp_dir: str, cfg: dict, N: int) -> np.ndarray:
+    """Evaluate the target model on the shared pool and return scaled logits.
+
+    Returns (N,) array of log(p_true / (1 - p_true)) — the LiRA statistic.
+    """
+    from models.resnet import ResNet18_Influence
+    from data.loader import offline_data_split
+
+    target_path = os.path.join(exp_dir, "target_model.pt")
+    if not os.path.exists(target_path):
+        raise FileNotFoundError(
+            f"Target model not found at {target_path}. "
+            "Run target training first."
+        )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = ResNet18_Influence().to(device)
+    state_dict = torch.load(target_path, map_location=device, weights_only=False)
+    if "model_state_dict" in state_dict:
+        model.load_state_dict(state_dict["model_state_dict"])
+    else:
+        model.load_state_dict(state_dict)
+    model.eval()
+
+    mean = cfg["data_mean"]
+    std = cfg["data_std"]
+    transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
+
+    train_ds = torchvision.datasets.CIFAR10(
+        root=cfg["data_dir"], train=True, download=False, transform=transform
+    )
+    test_ds = torchvision.datasets.CIFAR10(
+        root=cfg["data_dir"], train=False, download=False, transform=transform
+    )
+
+    class _Args:
+        pass
+    _args = _Args()
+    _args.seed = cfg["seed"]
+
+    full_dataset = ConcatDataset([train_ds, test_ds])
+    shared_pool = offline_data_split(full_dataset, _args.seed, "target")
+    assert len(shared_pool) == N, (
+        f"Shared pool size mismatch: expected {N}, got {len(shared_pool)}"
+    )
+
+    loader = DataLoader(shared_pool, batch_size=256, shuffle=False, num_workers=2)
+    scores = []
+    with torch.no_grad():
+        for inputs, targets in loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            logits = model(inputs)
+            probs = torch.softmax(logits, dim=1)
+            p_true = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+            p_true = torch.clamp(p_true, min=1e-7, max=1.0 - 1e-7)
+            scores.append(torch.log(p_true / (1.0 - p_true)).cpu().numpy())
+
+    return np.concatenate(scores)
+
+
+# ---------------------------------------------------------------------------
 # LiRA log-likelihood ratio
 # ---------------------------------------------------------------------------
 
-def _compute_lira_scores(lira_stats, in_masks):
+def _compute_lira_scores(lira_stats, in_masks, target_scores: np.ndarray):
     """Compute per-point LiRA log-LR scores.
 
     For each point i, fit Gaussian IN and OUT distributions from the shadows
-    that included / excluded it, then evaluate log p(t_i | IN) - log p(t_i | OUT).
+    that included / excluded it, then evaluate log p(t_i | IN) - log p(t_i | OUT)
+    where t_i is the scaled logit from the *target model* (not the shadow mean).
 
     Returns (N,) array of log-LR scores.
     """
     K = len(lira_stats)
     N = lira_stats[0].shape[0]
+    all_vals = np.stack(lira_stats, axis=0)  # (K, N)
+    global_std = np.std(all_vals, ddof=1) + 1e-8
 
     log_lr = np.zeros(N)
 
     for i in range(N):
-        in_vals = [lira_stats[k][i] for k in range(K) if in_masks[k][i]]
-        out_vals = [lira_stats[k][i] for k in range(K) if not in_masks[k][i]]
+        in_vals = np.array([lira_stats[k][i] for k in range(K) if in_masks[k][i]])
+        out_vals = np.array([lira_stats[k][i] for k in range(K) if not in_masks[k][i]])
 
         if len(in_vals) < 2 or len(out_vals) < 2:
             log_lr[i] = 0.0
             continue
 
-        in_vals = np.array(in_vals)
-        out_vals = np.array(out_vals)
+        mu_in = in_vals.mean()
+        mu_out = out_vals.mean()
+        sigma_in = in_vals.std(ddof=1) if len(in_vals) > 1 else global_std
+        sigma_out = out_vals.std(ddof=1) if len(out_vals) > 1 else global_std
+        sigma_in = sigma_in if sigma_in > 0 else global_std
+        sigma_out = sigma_out if sigma_out > 0 else global_std
 
-        mu_in, sigma_in = in_vals.mean(), in_vals.std() + 1e-8
-        mu_out, sigma_out = out_vals.mean(), out_vals.std() + 1e-8
-
-        # Use the shadow mean as the observed value (target not in shadow pool)
-        # We use the overall mean across all shadows as the "observed" statistic
-        # since we don't have a separate target query here.
-        obs = np.concatenate([in_vals, out_vals]).mean()
+        obs = target_scores[i]
         log_lr[i] = norm.logpdf(obs, mu_in, sigma_in) - norm.logpdf(obs, mu_out, sigma_out)
 
     return log_lr
@@ -311,8 +380,12 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
     ground_truth = _load_target_membership(exp_dir, pool_size=N)
     print(f"  Pool size N={N}, members={ground_truth.sum()}, non-members={(~ground_truth).sum()}")
 
+    print("\nEvaluating target model on shared pool...")
+    target_scores = _compute_target_lira_scores(exp_dir, cfg, N)
+    print(f"  Target scores: mean={target_scores.mean():.3f}, std={target_scores.std():.3f}")
+
     print("\nComputing LiRA log-LR scores...")
-    lira_scores = _compute_lira_scores(lira_stats, in_masks)
+    lira_scores = _compute_lira_scores(lira_stats, in_masks, target_scores)
 
     fpr_all, tpr_all, _ = roc_curve(ground_truth.astype(int), lira_scores)
     tpr_01pct_all = _tpr_at_fpr(fpr_all, tpr_all, max_fpr=0.001)
