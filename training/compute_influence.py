@@ -13,6 +13,7 @@ outputs/{dataset}/shadows/{shadow_id}/C_loss.npy     — loss influence   (N,)
 outputs/{dataset}/shadows/{shadow_id}/lira_stats.npy — scaled logits    (N,)
 """
 
+import gc
 import os
 import numpy as np
 import torch
@@ -323,4 +324,8 @@ def compute_influence(args, shadow_id, device):
         print(f"[shadow {shadow_id}] lira_stats saved to {lira_path}  "
               f"shape={lira_stats.shape}")
 
+    del model
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     print(f"[shadow {shadow_id}] compute_influence done.")

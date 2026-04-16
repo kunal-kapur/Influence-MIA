@@ -16,6 +16,7 @@ python -m experiments.run_experiment --dataset cifar10 --cuda 0 --output_dir /sc
 """
 
 import argparse
+import gc
 import os
 import sys
 import types
@@ -181,6 +182,9 @@ def main() -> None:
         for sid in shadow_ids:
             print(f"\n{'='*60}\nStage 2: Shadow model {sid} / {args.n_shadow_models - 1}\n{'='*60}")
             _run_shadow_one(args, sid, device)
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
     else:
         print("[shadows] --skip_shadows set — skipping shadow training.")
 

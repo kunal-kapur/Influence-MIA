@@ -1,4 +1,5 @@
 import copy
+import gc
 import os
 
 import numpy as np
@@ -64,6 +65,14 @@ def _load_checkpoint(ckpt_path, student, optimizer, scheduler, device, num_class
 
     start_epoch = ckpt["epoch"] + 1  # resume from next epoch
     return start_epoch, best_val_acc, warmup_model
+
+
+def _flush_state_dict(state_dict, path, num_classes):
+    """Instantiate a CPU model from state_dict, save to disk, then delete."""
+    m = ResNet18_Influence(num_classes=num_classes)
+    m.load_state_dict(state_dict)
+    save_model(m, path)
+    del m
 
 
 def train_shadow(args, shadow_id, device):
@@ -162,8 +171,8 @@ def train_shadow(args, shadow_id, device):
 
     alpha = 0.5  # weight between imitation loss and CE loss
 
-    warmup_model = None
-    best_model = None
+    warmup_model_state = None  # CPU state dict instead of GPU model
+    best_model_state = None    # CPU state dict instead of GPU model
     best_val_acc = 0.0
     start_epoch = 1
 
@@ -173,12 +182,17 @@ def train_shadow(args, shadow_id, device):
         start_epoch, best_val_acc, warmup_model = _load_checkpoint(
             ckpt_path, student, optimizer, scheduler, device, args.num_classes
         )
+        if warmup_model is not None:
+            warmup_model_state = warmup_model.state_dict()
+            del warmup_model
         print(f"[shadow {shadow_id}] Resumed at epoch {start_epoch}, "
               f"best_val_acc so far: {best_val_acc:.4f}")
-        # Restore best_model from shadow_model.pt if it already exists
+        # Restore best_model_state from shadow_model.pt if it already exists
         if os.path.exists(model_path):
-            best_model = ResNet18_Influence(num_classes=args.num_classes)
-            best_model = load_model(best_model, model_path, torch.device("cpu"))
+            tmp = ResNet18_Influence(num_classes=args.num_classes)
+            tmp = load_model(tmp, model_path, torch.device("cpu"))
+            best_model_state = tmp.state_dict()
+            del tmp
 
     # --- Training loop (Algorithm 1) ---
     for epoch in range(start_epoch, args.epochs + 1):
@@ -253,8 +267,9 @@ def train_shadow(args, shadow_id, device):
                 )
 
         # Save warmup checkpoint at the exact end of warmup phase
-        if epoch + 1 == warmup_epochs:
-            warmup_model = copy.deepcopy(student)
+        if epoch + 1 == args.warmup_epochs:
+            warmup_model_state = copy.deepcopy(student.cpu().state_dict())
+            student.to(device)
             print(f"[shadow {shadow_id}] Warmup checkpoint saved at epoch {epoch + 1}")
 
         # Track best model by val accuracy only after warmup
@@ -264,21 +279,34 @@ def train_shadow(args, shadow_id, device):
                   f"val_acc={val_acc:.4f}")
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
-                best_model = copy.deepcopy(student)
+                best_model_state = copy.deepcopy(student.cpu().state_dict())
+                student.to(device)
                 # Write best model immediately so a crash between epochs
                 # doesn't lose the best weights seen so far
-                save_model(best_model, model_path)
+                _flush_state_dict(best_model_state, model_path, args.num_classes)
 
         if scheduler is not None:
             scheduler.step()
 
         # Save epoch checkpoint (overwrites previous; atomic rename)
+        warmup_model_for_ckpt = None
+        if warmup_model_state is not None:
+            warmup_model_for_ckpt = ResNet18_Influence(num_classes=args.num_classes)
+            warmup_model_for_ckpt.load_state_dict(warmup_model_state)
         _save_checkpoint(out_dir, epoch, student, optimizer, scheduler,
-                         best_val_acc, warmup_model)
+                         best_val_acc, warmup_model_for_ckpt)
+        del warmup_model_for_ckpt
 
     # Fall back to last student state if no post-warmup epoch ran
-    if best_model is None:
-        best_model = copy.deepcopy(student)
+    if best_model_state is None:
+        best_model_state = copy.deepcopy(student.cpu().state_dict())
+        student.to(device)
+
+    # --- Flush training models from GPU ---
+    del student, teacher_model, optimizer, scheduler
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     # --- Quality gate ---
     if best_val_acc < args.imitate_acc:
@@ -288,12 +316,12 @@ def train_shadow(args, shadow_id, device):
 
     # --- Save final outputs ---
     # best_model.pt is already written incrementally; do a final save to be explicit
-    save_model(best_model, model_path)
+    _flush_state_dict(best_model_state, model_path, args.num_classes)
     print(f"[shadow {shadow_id}] Best val accuracy: {best_val_acc:.4f}  "
           f"Model saved to {model_path}")
 
-    if warmup_model is not None:
-        save_model(warmup_model, warmup_path)
+    if warmup_model_state is not None:
+        _flush_state_dict(warmup_model_state, warmup_path, args.num_classes)
         print(f"[shadow {shadow_id}] Warmup model saved to {warmup_path}")
 
     # Remove epoch checkpoint once training is cleanly complete
@@ -301,7 +329,7 @@ def train_shadow(args, shadow_id, device):
         os.remove(ckpt_path)
         print(f"[shadow {shadow_id}] Epoch checkpoint removed (training complete)")
 
-    return best_model
+    return None
 
 
 class _SkipSingleton:
