@@ -36,6 +36,9 @@ def _load_config(dataset: str) -> types.SimpleNamespace:
         )
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
+    cfg.setdefault("warmup_epochs", 1)
+    cfg.setdefault("temperature", 1.0)
+    cfg.setdefault("margin_weight", 1.0)
     return types.SimpleNamespace(**cfg)
 
 

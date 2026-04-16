@@ -15,8 +15,13 @@ mkdir -p logs
 
 DATASET="cifar10"
 OUTPUT_DIR="/scratch/scholar/kapur16/data/outputs/"
+DEVICE="cuda"
 CUDA=0
 EXP_NAME="/scratch/scholar/kapur16/imia_cifar10_run1"
+
+if [[ "${DEVICE}" == "cpu" ]]; then
+    CUDA=-1
+fi
 
 # ---------------------------------------------------------------------------
 # Full pipeline: target model -> all shadow models -> influence computation

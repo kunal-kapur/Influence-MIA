@@ -34,6 +34,9 @@ def load_config(dataset):
         )
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
+    cfg.setdefault("warmup_epochs", 1)
+    cfg.setdefault("temperature", 1.0)
+    cfg.setdefault("margin_weight", 1.0)
     return Namespace(**cfg)
 
 
@@ -70,11 +73,22 @@ def main():
     args.exp_dir = str(Path(cli.output_dir) / exp_name / cli.dataset)
     print(f"Experiment directory: {args.exp_dir}")
 
-    if cli.cuda >= 0 and torch.cuda.is_available():
-        device = torch.device(f"cuda:{cli.cuda}")
+    if torch.cuda.is_available() and cli.cuda >= 0:
+        gpu_count = torch.cuda.device_count()
+        if cli.cuda >= gpu_count:
+            print(
+                f"Requested cuda:{cli.cuda}, but only {gpu_count} GPU(s) visible. Falling back to cuda:0."
+            )
+            cli.cuda = 0
+        args.device = f"cuda:{cli.cuda}"
+        gpu_name = torch.cuda.get_device_name(cli.cuda)
+        print(f"CUDA available: {gpu_count} GPU(s). Using {args.device} ({gpu_name}).")
     else:
-        device = torch.device("cpu")
+        args.device = "cpu"
+        if cli.cuda >= 0:
+            print("CUDA not available; using CPU.")
 
+    device = torch.device(args.device)
     print(f"Using device: {device}")
     print(f"Config: {vars(args)}\n")
 

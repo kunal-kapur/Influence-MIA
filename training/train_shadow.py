@@ -5,7 +5,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
-from tqdm import tqdm
 
 from data.loader import load_dataset, get_dataset
 from models.resnet import ResNet18_Influence
@@ -88,6 +87,18 @@ def train_shadow(args, shadow_id, device):
     mask_path = os.path.join(out_dir, "in_mask.npy")
     warmup_path = os.path.join(out_dir, "warmup_model.pt")
     ckpt_path = os.path.join(out_dir, "checkpoint.pt")
+
+    # Backward-compatible defaults for older configs that do not define
+    # IMIA-specific hyperparameters.
+    warmup_epochs = int(getattr(args, "warmup_epochs", 1))
+    temperature = float(getattr(args, "temperature", 1.0))
+    margin_weight = float(getattr(args, "margin_weight", 1.0))
+    if warmup_epochs < 1:
+        raise ValueError(f"warmup_epochs must be >= 1, got {warmup_epochs}")
+    if temperature <= 0:
+        raise ValueError(f"temperature must be > 0, got {temperature}")
+    if margin_weight <= 0:
+        raise ValueError(f"margin_weight must be > 0, got {margin_weight}")
 
     # --- 1. Shared pool ---
     shared_pool = _build_shared_pool(args)
@@ -172,10 +183,12 @@ def train_shadow(args, shadow_id, device):
     # --- Training loop (Algorithm 1) ---
     for epoch in range(start_epoch, args.epochs + 1):
         student.train()
-        pbar = tqdm(train_dl, leave=False,
-                    desc=f"[shadow {shadow_id}] Epoch {epoch}/{args.epochs}")
+        running_loss = 0.0
+        running_ce_loss = 0.0
+        running_imitate_loss = 0.0
+        n_batches = 0
 
-        for x, y in pbar:
+        for x, y in train_dl:
             if x.size(0) == 1:
                 continue
 
@@ -184,18 +197,17 @@ def train_shadow(args, shadow_id, device):
             student_logits = student(x)
             ce_loss = ce_criterion(student_logits, y)
 
-            if epoch < args.warmup_epochs:
+            if epoch < warmup_epochs:
                 # Phase 1: warmup — CE loss only
                 loss = ce_loss
-                pbar.set_postfix_str(f"loss: {loss.item():.3f}")
             else:
                 # Phase 2: imitation — MSE distillation against frozen teacher
                 with torch.no_grad():
                     teacher_logits = teacher_model(x)
 
                 # Temperature scaling
-                s_logits = student_logits / args.temperature
-                t_logits = teacher_logits / args.temperature
+                s_logits = student_logits / temperature
+                t_logits = teacher_logits / temperature
 
                 # Weight matrix: ones everywhere, margin_weight at true class
                 # and at the max incorrect class of teacher
@@ -205,8 +217,8 @@ def train_shadow(args, shadow_id, device):
                 max_incorrect = tmp.argmax(dim=1)
 
                 weight_matrix = torch.ones_like(s_logits)
-                weight_matrix[batch_idx, y] = args.margin_weight
-                weight_matrix[batch_idx, max_incorrect] = args.margin_weight
+                weight_matrix[batch_idx, y] = margin_weight
+                weight_matrix[batch_idx, max_incorrect] = margin_weight
 
                 imitate_loss = mse_criterion(
                     s_logits * weight_matrix,
@@ -215,23 +227,38 @@ def train_shadow(args, shadow_id, device):
                 imitate_loss = imitate_loss / weight_matrix.mean()
 
                 loss = alpha * imitate_loss + (1.0 - alpha) * ce_loss
-                pbar.set_postfix_str(
-                    f"loss: {loss.item():.3f}  "
-                    f"ce: {ce_loss.item():.3f}  "
-                    f"imitate: {imitate_loss.item():.3f}"
-                )
+                running_imitate_loss += imitate_loss.item()
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
+            running_loss += loss.item()
+            running_ce_loss += ce_loss.item()
+            n_batches += 1
+
+        if n_batches > 0:
+            if epoch < warmup_epochs:
+                print(
+                    f"[shadow {shadow_id}] Epoch [{epoch:3d}/{args.epochs}] "
+                    f"train_loss={running_loss / n_batches:.4f} "
+                    f"ce_loss={running_ce_loss / n_batches:.4f}"
+                )
+            else:
+                print(
+                    f"[shadow {shadow_id}] Epoch [{epoch:3d}/{args.epochs}] "
+                    f"train_loss={running_loss / n_batches:.4f} "
+                    f"ce_loss={running_ce_loss / n_batches:.4f} "
+                    f"imitate_loss={running_imitate_loss / n_batches:.4f}"
+                )
+
         # Save warmup checkpoint at the exact end of warmup phase
-        if epoch + 1 == args.warmup_epochs:
+        if epoch + 1 == warmup_epochs:
             warmup_model = copy.deepcopy(student)
             print(f"[shadow {shadow_id}] Warmup checkpoint saved at epoch {epoch + 1}")
 
         # Track best model by val accuracy only after warmup
-        if epoch >= args.warmup_epochs:
+        if epoch >= warmup_epochs:
             val_acc = evaluate(student, val_dl, ce_criterion, device)[1]
             print(f"[shadow {shadow_id}] Epoch [{epoch:3d}/{args.epochs}]  "
                   f"val_acc={val_acc:.4f}")

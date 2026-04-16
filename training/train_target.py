@@ -35,6 +35,8 @@ def _load_checkpoint(ckpt_path, model, optimizer, scheduler, device):
 
 
 def train_target(args, device):
+    os.makedirs(args.exp_dir, exist_ok=True)
+
     # 1. Load the 20,000-sample target pool
     target_pool = load_dataset(args, data_type="target")
 

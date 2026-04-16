@@ -47,6 +47,9 @@ def _load_config(dataset: str) -> types.SimpleNamespace:
         )
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
+    cfg.setdefault("warmup_epochs", 1)
+    cfg.setdefault("temperature", 1.0)
+    cfg.setdefault("margin_weight", 1.0)
     return types.SimpleNamespace(**cfg)
 
 
@@ -147,8 +150,14 @@ def main() -> None:
     cli = _parse_args()
     args = _make_args(cli)
 
+    print("[debug] CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
+    print("[debug] torch.version.cuda:", torch.version.cuda)
+    print("[debug] torch.cuda.is_available():", torch.cuda.is_available())
+    print("[debug] torch.cuda.device_count():", torch.cuda.device_count())
+
     if torch.cuda.is_available() and cli.cuda >= 0:
         device = torch.device(f"cuda:{cli.cuda}")
+        print("[debug] using", device, "name:", torch.cuda.get_device_name(cli.cuda))
     else:
         device = torch.device("cpu")
 
