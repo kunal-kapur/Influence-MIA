@@ -50,24 +50,16 @@ def train_target(args, device):
     val_indices = np.array(val_ds.indices)
 
     # 3. DataLoaders
-    train_loader = DataLoader(
-        train_ds,
+    use_cuda = device.type == "cuda"
+    loader_kwargs = dict(
         batch_size=args.batch_size,
-        shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=use_cuda,
         persistent_workers=args.num_workers > 0,
         prefetch_factor=2 if args.num_workers > 0 else None,
     )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        persistent_workers=args.num_workers > 0,
-        prefetch_factor=2 if args.num_workers > 0 else None,
-    )
+    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
 
     # 4. Model, optimizer, scheduler
     model = ResNet18_Influence(num_classes=args.num_classes).to(device)
