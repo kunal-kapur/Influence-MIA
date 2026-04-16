@@ -76,7 +76,7 @@ def _make_args(cli: argparse.Namespace) -> types.SimpleNamespace:
     cfg = _load_config(cli.dataset)
     args = types.SimpleNamespace(**vars(cfg))
     args.dataset = cli.dataset
-    exp_name = _make_exp_name(args)
+    exp_name = cli.exp_name if cli.exp_name else _make_exp_name(args)
     args.exp_dir = str(Path(cli.output_dir) / exp_name / cli.dataset)
     return args
 
@@ -91,6 +91,10 @@ def _parse_args() -> argparse.Namespace:
                         help="CUDA device index (-1 for CPU)")
     parser.add_argument("--output_dir", default="outputs",
                         help="Root directory for all outputs (default: outputs/)")
+    parser.add_argument("--exp_name", default=None,
+                        help="Experiment name (subdirectory under output_dir). "
+                             "If omitted, auto-generated from hyperparameters. "
+                             "Pass the same name to resume a crashed run.")
     parser.add_argument("--shadow_id", type=int, default=None,
                         help="Run a single shadow model ID instead of all")
     parser.add_argument("--skip_target", action="store_true",
