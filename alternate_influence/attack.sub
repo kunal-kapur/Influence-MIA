@@ -1,0 +1,23 @@
+#!/bin/bash
+#SBATCH -A gpu
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:1
+#SBATCH -t 4:00:00
+#SBATCH -o logs/%x-%j.out
+
+echo "Running on compute node:"
+echo $(hostname)
+echo "CUDA_VISIBLE_DEVICES is set to: $CUDA_VISIBLE_DEVICES"
+
+mkdir -p logs
+mkdir -p /scratch/scholar/kapur16/attacks
+
+srun python -u shadow_attack.py \
+    --checkpoint-dir ./checkpoints/10pct_seed42_overfit \
+    --num_queries 2000 \
+    --num_shadow_models 64 \
+    --member-percentage 0.5 \
+    --shadow-epochs 100 \
+    --use-final-model \
+    --analyze-influence \
+    --attack-dir /scratch/scholar/kapur16/attacks

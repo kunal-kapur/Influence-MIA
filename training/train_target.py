@@ -3,7 +3,7 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, random_split
 
 from data import load_dataset
 from models import ResNet18_Influence
@@ -37,21 +37,51 @@ def _load_checkpoint(ckpt_path, model, optimizer, scheduler, device):
 def train_target(args, device):
     os.makedirs(args.exp_dir, exist_ok=True)
 
-    # 1. Load the 20,000-sample target pool
+    # ------------------------------------------------------------------
+    # 1. Load the 20 000-sample target pool  (D in the threat model)
+    # ------------------------------------------------------------------
     target_pool = load_dataset(args, data_type="target")
+    pool_size = len(target_pool)
 
-    # 2. Split 80/20 into train / val
-    n_train = int(0.8 * len(target_pool))
-    n_val = len(target_pool) - n_train
+    # ------------------------------------------------------------------
+    # 2. Split D into D_train (80 %) and D_nonmember (20 %)
+    # ------------------------------------------------------------------
+    n_train = int(0.8 * pool_size)
+    n_nonmember = pool_size - n_train
 
     generator = torch.Generator().manual_seed(args.seed)
-    train_ds, val_ds = random_split(target_pool, [n_train, n_val], generator=generator)
+    train_ds, nonmember_ds = random_split(
+        target_pool, [n_train, n_nonmember], generator=generator
+    )
 
-    # Capture the underlying indices relative to target_pool
-    train_indices = np.array(train_ds.indices)
-    val_indices = np.array(val_ds.indices)
+    # Pool-relative indices (0 .. pool_size-1)
+    train_pool_indices    = np.array(train_ds.indices,     dtype=np.int64)
+    nonmember_pool_indices = np.array(nonmember_ds.indices, dtype=np.int64)
 
-    # 3. DataLoaders
+    # ------------------------------------------------------------------
+    # 3. Build a balanced query set  D_query = D_a ∪ D_b
+    #    D_a ⊂ D_train      (member     queries)
+    #    D_b ⊂ D \ D_train  (non-member queries)
+    #    |D_a| = |D_b| = min(n_train, n_nonmember)
+    # ------------------------------------------------------------------
+    n_query_half = min(n_train, n_nonmember)
+
+    rng = np.random.default_rng(args.seed)
+    da_pool_indices = rng.choice(train_pool_indices,    n_query_half, replace=False)
+    db_pool_indices = rng.choice(nonmember_pool_indices, n_query_half, replace=False)
+
+    # query_pool_indices: pool-relative positions of each query point,
+    # in the order [Da members ... Db non-members].
+    query_pool_indices = np.concatenate([da_pool_indices, db_pool_indices])  # (2*n_query_half,)
+    n_query = len(query_pool_indices)
+
+    # ground_truth[i] = 1 if query point i is a member of D_train, else 0.
+    ground_truth = np.zeros(n_query, dtype=np.int32)
+    ground_truth[:n_query_half] = 1  # first half are Da (members)
+
+    # ------------------------------------------------------------------
+    # 4. DataLoaders for training
+    # ------------------------------------------------------------------
     use_cuda = device.type == "cuda"
     loader_kwargs = dict(
         batch_size=args.batch_size,
@@ -60,25 +90,29 @@ def train_target(args, device):
         persistent_workers=args.num_workers > 0,
         prefetch_factor=2 if args.num_workers > 0 else None,
     )
-    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
-    val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
+    train_loader    = DataLoader(train_ds,     shuffle=True,  **loader_kwargs)
+    val_loader      = DataLoader(nonmember_ds, shuffle=False, **loader_kwargs)
 
-    # 4. Model, optimizer, scheduler
+    # ------------------------------------------------------------------
+    # 5. Model, optimizer, scheduler
+    # ------------------------------------------------------------------
     model = ResNet18_Influence(num_classes=args.num_classes).to(device)
     optimizer = build_optimizer(args, model.parameters())
     scheduler = build_scheduler(args, optimizer)
 
     use_amp = device.type == "cuda"
-    scaler = torch.amp.GradScaler() if use_amp else None
+    scaler  = torch.amp.GradScaler() if use_amp else None
 
-    criterion = nn.CrossEntropyLoss()
+    criterion  = nn.CrossEntropyLoss()
     model_path = os.path.join(args.exp_dir, "target_model.pt")
-    ckpt_path = os.path.join(args.exp_dir, "target_checkpoint.pt")
+    ckpt_path  = os.path.join(args.exp_dir, "target_checkpoint.pt")
 
     best_val_acc = 0.0
-    start_epoch = 1
+    start_epoch  = 1
 
-    # 5. Resume from checkpoint if one exists
+    # ------------------------------------------------------------------
+    # 6. Resume from checkpoint if one exists
+    # ------------------------------------------------------------------
     if os.path.exists(ckpt_path):
         print(f"[target] Resuming from checkpoint {ckpt_path}")
         start_epoch, best_val_acc = _load_checkpoint(
@@ -86,7 +120,9 @@ def train_target(args, device):
         )
         print(f"[target] Resumed at epoch {start_epoch}, best_val_acc so far: {best_val_acc:.4f}")
 
-    # 6. Training loop
+    # ------------------------------------------------------------------
+    # 7. Training loop
+    # ------------------------------------------------------------------
     eval_interval = 5
     val_loss, val_acc = float("nan"), float("nan")
     for epoch in range(start_epoch, args.epochs + 1):
@@ -110,20 +146,32 @@ def train_target(args, device):
 
         _save_checkpoint(args.exp_dir, epoch, model, optimizer, scheduler, best_val_acc)
 
-    # Ensure final model is saved (covers case where last epoch wasn't an eval epoch)
     if not os.path.exists(model_path):
         save_model(model, model_path)
 
     print(f"[target] Best val accuracy: {best_val_acc:.4f}  Model saved to {model_path}")
 
-    # Remove checkpoint once training completes cleanly
     if os.path.exists(ckpt_path):
         os.remove(ckpt_path)
         print("[target] Epoch checkpoint removed (training complete)")
 
-    # 7. Save indices
-    train_idx_path = f"{args.exp_dir}/target_train_indices.npy"
-    val_idx_path = f"{args.exp_dir}/target_val_indices.npy"
-    save_array(train_indices, train_idx_path)
-    save_array(val_indices, val_idx_path)
-    print(f"Indices saved to {train_idx_path} and {val_idx_path}")
+    # ------------------------------------------------------------------
+    # 8. Save metadata
+    #
+    # target_train_indices.npy  — pool-relative indices of D_train  (n_train,)
+    # query_indices.npy         — pool-relative indices of D_query  (2*n_query_half,)
+    #                             order: [Da members | Db non-members]
+    # ground_truth.npy          — 1/0 membership labels aligned to query_indices (n_query,)
+    # ------------------------------------------------------------------
+    save_array(train_pool_indices,  os.path.join(args.exp_dir, "target_train_indices.npy"))
+    save_array(query_pool_indices,  os.path.join(args.exp_dir, "query_indices.npy"))
+    save_array(ground_truth,        os.path.join(args.exp_dir, "ground_truth.npy"))
+
+    print(
+        f"[target] Saved metadata:\n"
+        f"  target_train_indices : {n_train} points\n"
+        f"  query_indices        : {n_query} points  "
+        f"({n_query_half} members + {n_query_half} non-members)\n"
+        f"  ground_truth         : {ground_truth.sum()} members, "
+        f"{(ground_truth == 0).sum()} non-members"
+    )

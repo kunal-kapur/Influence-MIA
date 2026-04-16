@@ -5,8 +5,7 @@ import torchvision.transforms as transforms
 
 
 def get_dataset(args):
-    """Return the torchvision dataset class for CIFAR-10 and set dataset
-    metadata on args (data_mean, data_std, num_classes)."""
+    """Return CIFAR-10 dataset class and set metadata on args."""
     args.data_mean = [0.4914, 0.4822, 0.4465]
     args.data_std = [0.2023, 0.1994, 0.2010]
     args.num_classes = 10
@@ -15,42 +14,51 @@ def get_dataset(args):
 
 def offline_data_split(dataset, seed, data_type):
     """
-    Split dataset into:
-      - shared pool for 'target' and 'shadow'
-      - small disjoint 'validation' split
-      - remaining disjoint 'reference' split
+    Split the full 60k CIFAR-10 dataset deterministically into four disjoint pools:
+
+      target     : n // 3        (20 000) — candidate set D for target model
+      shadow     : n // 3        (20 000) — auxiliary pool for shadow model training
+      validation : n // 12       ( 5 000) — small held-out split
+      reference  : remainder     (15 000) — disjoint reference data
+
+    Sizes are fixed by n and the seed; changing either invalidates saved artifacts.
     """
     assert data_type in ("target", "shadow", "validation", "reference"), (
-        f"Unknown data_type: {data_type}"
+        f"Unknown data_type '{data_type}'. "
+        "Expected one of: target, shadow, validation, reference."
     )
 
     n = len(dataset)
 
-    shared_size = n // 3          # e.g. 20,000 if n = 60,000
-    validation_size = n // 12     # e.g. 5,000 if n = 60,000
-    reference_size = n - shared_size - validation_size
+    target_size     = n // 3          # 20 000
+    shadow_size     = n // 3          # 20 000
+    validation_size = n // 12         #  5 000
+    reference_size  = n - target_size - shadow_size - validation_size  # 15 000
 
     generator = torch.Generator().manual_seed(seed)
-    shared_split, validation_split, reference_split = random_split(
+    target_split, shadow_split, validation_split, reference_split = random_split(
         dataset,
-        [shared_size, validation_size, reference_size],
+        [target_size, shadow_size, validation_size, reference_size],
         generator=generator,
     )
 
-    if data_type in ("target", "shadow"):
-        return shared_split
-    elif data_type == "validation":
-        return validation_split
-    else:  # reference
-        return reference_split
+    return {
+        "target":     target_split,
+        "shadow":     shadow_split,
+        "validation": validation_split,
+        "reference":  reference_split,
+    }[data_type]
 
 
 def load_dataset(args, data_type="target"):
-    """Load CIFAR-10 train+test (60,000 total), apply transforms, and return
-    the 20,000-sample subset for the requested data_type."""
-    mean = args.data_mean
-    std = args.data_std
+    """
+    Load CIFAR-10 train+test, apply transforms, and return the requested split.
 
+    Training splits (target, shadow) get data augmentation.
+    Evaluation splits (validation, reference) get normalisation only.
+    """
+    mean = args.data_mean
+    std  = args.data_std
     normalize = transforms.Normalize(mean, std)
 
     if data_type in ("target", "shadow"):
@@ -60,7 +68,7 @@ def load_dataset(args, data_type="target"):
             transforms.ToTensor(),
             normalize,
         ])
-    else:  # reference — no augmentation
+    else:
         transform = transforms.Compose([
             transforms.ToTensor(),
             normalize,
