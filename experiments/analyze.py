@@ -23,6 +23,7 @@ python -m experiments.analyze --exp_dir outputs/<exp_name>/cifar10 --num_buckets
 """
 
 import argparse
+import csv
 import os
 import sys
 import types
@@ -353,6 +354,154 @@ def _plot_score_vs_mia(score_name, scores, mia_scores, ground_truth, out_dir):
     plt.close(fig)
 
 
+def _plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, out_dir,
+                                num_buckets=10, min_points=10):
+    """Plot one fitted GMM per influence bucket and save each plot separately.
+
+    Each bucket plot shows:
+    - the member vs non-member score distributions inside the bucket,
+    - the fitted 2-component GMM density,
+    - each individual Gaussian component density,
+    - vertical markers at the component means.
+
+    The plots are written to a dedicated subdirectory so each bucket can be
+    inspected independently.
+    """
+    bucket_plot_dir = os.path.join(out_dir, "gmm_bucket_components")
+    os.makedirs(bucket_plot_dir, exist_ok=True)
+    csv_rows = []
+    quantiles = np.quantile(influence_scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
+    bucket_ids = np.digitize(influence_scores, quantiles)
+
+    for b in range(num_buckets):
+        idx = np.where(bucket_ids == b)[0]
+        if len(idx) == 0:
+            continue
+
+        bucket_scores = mia_scores[idx]
+        bucket_members = ground_truth[idx] == 1
+        bucket_non_members = ~bucket_members
+        member_scores = bucket_scores[bucket_members]
+        non_member_scores = bucket_scores[bucket_non_members]
+
+        score_min = float(bucket_scores.min())
+        score_max = float(bucket_scores.max())
+        if np.isclose(score_min, score_max):
+            score_min -= 0.5
+            score_max += 0.5
+
+        x_grid = np.linspace(score_min, score_max, 300)
+
+        fig, ax = plt.subplots(figsize=(7.2, 4.8))
+
+        if len(idx) >= min_points:
+            X = bucket_scores.reshape(-1, 1)
+            gmm = GaussianMixture(n_components=2, random_state=0)
+            gmm.fit(X)
+
+            weights = gmm.weights_.ravel()
+            means = gmm.means_.ravel()
+            variances = gmm.covariances_.reshape(-1)
+            component_pdfs = []
+            for component_id in range(2):
+                var = float(max(variances[component_id], 1e-6))
+                mean = float(means[component_id])
+                weight = float(weights[component_id])
+                pdf = weight * (1.0 / np.sqrt(2.0 * np.pi * var)) * np.exp(-0.5 * ((x_grid - mean) ** 2) / var)
+                component_pdfs.append(pdf)
+
+            total_pdf = np.sum(component_pdfs, axis=0)
+            in_component = int(np.argmax(means))
+
+            posterior = gmm.predict_proba(X)
+            p_in = posterior[:, in_component]
+            p_out = 1.0 - p_in
+        else:
+            gmm = None
+            total_pdf = None
+            component_pdfs = []
+            means = np.array([])
+            in_component = None
+            p_in = np.full(len(idx), np.nan, dtype=float)
+            p_out = np.full(len(idx), np.nan, dtype=float)
+
+            if len(idx) > 0:
+                ranks = np.argsort(np.argsort(bucket_scores)).astype(float)
+                p_in = ranks / max(len(idx) - 1, 1)
+                p_out = 1.0 - p_in
+
+        predicted_is_in = p_in >= 0.5
+
+        bins = np.linspace(score_min, score_max, 28)
+        ax.hist(non_member_scores, bins=bins, density=True, alpha=0.45,
+                color="tomato", label="out / non-member")
+        ax.hist(member_scores, bins=bins, density=True, alpha=0.45,
+                color="steelblue", label="in / member")
+
+        if total_pdf is not None:
+            ax.plot(x_grid, total_pdf, color="black", linewidth=2.0, label="GMM total")
+            component_colors = ["darkorange", "purple"]
+            for component_id, pdf in enumerate(component_pdfs):
+                label = f"Gaussian {component_id + 1}"
+                if in_component is not None and component_id == in_component:
+                    label += " (higher mean / IN)"
+                ax.plot(x_grid, pdf, linestyle="--", linewidth=1.8,
+                        color=component_colors[component_id], label=label)
+                ax.axvline(float(means[component_id]), color=component_colors[component_id],
+                           linestyle=":", linewidth=1.0)
+        else:
+            ax.text(0.5, 0.9, "Too few points for GMM", transform=ax.transAxes,
+                    ha="center", va="top", fontsize=9)
+
+        ax.set_title(
+            f"Bucket {b}  n={len(idx)}  in={int(bucket_members.sum())}  out={int(bucket_non_members.sum())}"
+        )
+        ax.set_xlabel("MIA score")
+        ax.set_ylabel("Density")
+        ax.legend(fontsize=8, loc="best")
+
+        fig.tight_layout()
+        out_path = os.path.join(bucket_plot_dir, f"bucket_{b:02d}_gmm_components.png")
+        fig.savefig(out_path, dpi=120)
+        plt.close(fig)
+
+        for local_pos, point_idx in enumerate(idx):
+            csv_rows.append({
+                "point_index": int(point_idx),
+                "bucket": int(b),
+                "bucket_size": int(len(idx)),
+                "mia_score": float(bucket_scores[local_pos]),
+                "ground_truth": int(ground_truth[point_idx]),
+                "ground_truth_label": "in" if ground_truth[point_idx] == 1 else "out",
+                "predicted_label": "in" if bool(predicted_is_in[local_pos]) else "out",
+                "p_in": float(p_in[local_pos]),
+                "p_out": float(p_out[local_pos]),
+            })
+
+    csv_rows.sort(key=lambda row: (row["bucket"], row["mia_score"], row["point_index"]))
+    csv_path = os.path.join(bucket_plot_dir, "bucket_points_sorted.csv")
+    with open(csv_path, "w", newline="") as csv_file:
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=[
+                "point_index",
+                "bucket",
+                "bucket_size",
+                "mia_score",
+                "ground_truth",
+                "ground_truth_label",
+                "predicted_label",
+                "p_in",
+                "p_out",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(csv_rows)
+
+    print(f"  Saved bucket-wise GMM component plots to {bucket_plot_dir}")
+    print(f"  Saved sorted bucket-point CSV to {csv_path}")
+
+
 # ---------------------------------------------------------------------------
 # Core analysis
 # ---------------------------------------------------------------------------
@@ -490,6 +639,8 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
           f"TPR@0.1%FPR={tpr_01pct_gmm*100:.2f}%, "
           f"TPR@1%FPR={tpr_1pct_gmm*100:.2f}%, "
           f"Balanced Acc={bal_acc_gmm*100:.2f}%")
+
+    _plot_gmm_bucket_components(scores_C_lira, mia_scores, ground_truth, out_dir, num_buckets)
 
     # ------------------------------------------------------------------
     # 7. Save analysis outputs
