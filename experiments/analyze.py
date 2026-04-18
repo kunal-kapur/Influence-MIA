@@ -229,12 +229,13 @@ def _gmm_aggregate_mia_scores(
     mia_scores: np.ndarray,
     num_buckets: int = 10,
 ) -> np.ndarray:
-    """Bucket-wise GMM aggregation of MIA scores.
+    """Bucket-wise GMM aggregation of MIA scores with BIC-based model selection.
 
-    For each influence bucket, fit a 2-component GMM on the raw discrepancy
-    scores of points in that bucket. The IN-distribution component is the one
-    with the higher mean. Returns a global array of P(IN) probabilities, one
-    per point, assembled across all buckets.
+    For each influence bucket, fits both a 1-component and 2-component GMM and
+    uses BIC to decide which is appropriate:
+      - BIC(1) <= BIC(2): no separable signal; assign p_in = 0.5 for all points.
+      - BIC(2) <  BIC(1): separable IN/OUT distributions; extract P(IN) via the
+                           component with the higher mean.
 
     Points in buckets too small to fit a GMM (< 10) fall back to a
     rank-normalised version of their raw mia_score.
@@ -254,15 +255,16 @@ def _gmm_aggregate_mia_scores(
             continue
 
         X = mia_scores[idx].reshape(-1, 1)
-        gmm = GaussianMixture(n_components=2, random_state=0)
-        gmm.fit(X)
+        gmm_1 = GaussianMixture(n_components=1, reg_covar=1e-3, random_state=0).fit(X)
+        gmm_2 = GaussianMixture(n_components=2, reg_covar=1e-3, random_state=0).fit(X)
 
-        # IN component = higher mean
-        in_component = int(np.argmax(gmm.means_.ravel()))
-
-        # P(IN | x) for each point in this bucket
-        probs = gmm.predict_proba(X)[:, in_component]
-        gmm_probs[idx] = probs
+        if gmm_1.bic(X) <= gmm_2.bic(X):
+            print(f"  [Bucket {b}] BIC favours 1-component — defaulting to p_in=0.5 "
+                  f"(no separable membership signal, n={len(idx)})")
+            gmm_probs[idx] = 0.5
+        else:
+            in_component = int(np.argmax(gmm_2.means_.ravel()))
+            gmm_probs[idx] = gmm_2.predict_proba(X)[:, in_component]
 
     return gmm_probs
 
@@ -396,26 +398,43 @@ def _plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, out_
 
         if len(idx) >= min_points:
             X = bucket_scores.reshape(-1, 1)
-            gmm = GaussianMixture(n_components=2, random_state=0)
-            gmm.fit(X)
+            gmm_1 = GaussianMixture(n_components=1, reg_covar=1e-3, random_state=0).fit(X)
+            gmm_2 = GaussianMixture(n_components=2, reg_covar=1e-3, random_state=0).fit(X)
 
-            weights = gmm.weights_.ravel()
-            means = gmm.means_.ravel()
-            variances = gmm.covariances_.reshape(-1)
-            component_pdfs = []
-            for component_id in range(2):
-                var = float(max(variances[component_id], 1e-6))
-                mean = float(means[component_id])
-                weight = float(weights[component_id])
-                pdf = weight * (1.0 / np.sqrt(2.0 * np.pi * var)) * np.exp(-0.5 * ((x_grid - mean) ** 2) / var)
-                component_pdfs.append(pdf)
-
-            total_pdf = np.sum(component_pdfs, axis=0)
-            in_component = int(np.argmax(means))
-
-            posterior = gmm.predict_proba(X)
-            p_in = posterior[:, in_component]
-            p_out = 1.0 - p_in
+            if gmm_1.bic(X) <= gmm_2.bic(X):
+                # No separable signal — show the 1-component fit, assign p_in=0.5
+                gmm = gmm_1
+                weights = gmm.weights_.ravel()
+                means = gmm.means_.ravel()
+                variances = gmm.covariances_.reshape(-1)
+                component_pdfs = []
+                for component_id in range(1):
+                    var = float(max(variances[component_id], 1e-6))
+                    mean = float(means[component_id])
+                    weight = float(weights[component_id])
+                    pdf = weight * (1.0 / np.sqrt(2.0 * np.pi * var)) * np.exp(-0.5 * ((x_grid - mean) ** 2) / var)
+                    component_pdfs.append(pdf)
+                total_pdf = np.sum(component_pdfs, axis=0)
+                in_component = None
+                p_in = np.full(len(idx), 0.5)
+                p_out = np.full(len(idx), 0.5)
+            else:
+                gmm = gmm_2
+                weights = gmm.weights_.ravel()
+                means = gmm.means_.ravel()
+                variances = gmm.covariances_.reshape(-1)
+                component_pdfs = []
+                for component_id in range(2):
+                    var = float(max(variances[component_id], 1e-6))
+                    mean = float(means[component_id])
+                    weight = float(weights[component_id])
+                    pdf = weight * (1.0 / np.sqrt(2.0 * np.pi * var)) * np.exp(-0.5 * ((x_grid - mean) ** 2) / var)
+                    component_pdfs.append(pdf)
+                total_pdf = np.sum(component_pdfs, axis=0)
+                in_component = int(np.argmax(means))
+                posterior = gmm.predict_proba(X)
+                p_in = posterior[:, in_component]
+                p_out = 1.0 - p_in
         else:
             gmm = None
             total_pdf = None
@@ -465,11 +484,13 @@ def _plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, out_
         fig.savefig(out_path, dpi=120)
         plt.close(fig)
 
+        bic_n_components = 1 if in_component is None and len(idx) >= min_points else (2 if len(idx) >= min_points else None)
         for local_pos, point_idx in enumerate(idx):
             csv_rows.append({
                 "point_index": int(point_idx),
                 "bucket": int(b),
                 "bucket_size": int(len(idx)),
+                "bic_n_components": bic_n_components,
                 "mia_score": float(bucket_scores[local_pos]),
                 "ground_truth": int(ground_truth[point_idx]),
                 "ground_truth_label": "in" if ground_truth[point_idx] == 1 else "out",
@@ -487,6 +508,7 @@ def _plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, out_
                 "point_index",
                 "bucket",
                 "bucket_size",
+                "bic_n_components",
                 "mia_score",
                 "ground_truth",
                 "ground_truth_label",
