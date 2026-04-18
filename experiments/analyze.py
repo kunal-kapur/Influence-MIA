@@ -37,6 +37,7 @@ import torchvision
 import torchvision.transforms as transforms
 import yaml
 from sklearn.metrics import roc_curve
+from sklearn.mixture import GaussianMixture
 from torch.utils.data import ConcatDataset, DataLoader, Subset
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -220,6 +221,49 @@ def _aggregate_influence(C_list):
     """Mean influence score across all shadows per query point."""
     K = len(C_list)
     return np.stack([C_list[k] for k in range(K)], axis=0).mean(axis=0)
+
+
+def _gmm_aggregate_mia_scores(
+    influence_scores: np.ndarray,
+    mia_scores: np.ndarray,
+    num_buckets: int = 10,
+) -> np.ndarray:
+    """Bucket-wise GMM aggregation of MIA scores.
+
+    For each influence bucket, fit a 2-component GMM on the raw discrepancy
+    scores of points in that bucket. The IN-distribution component is the one
+    with the higher mean. Returns a global array of P(IN) probabilities, one
+    per point, assembled across all buckets.
+
+    Points in buckets too small to fit a GMM (< 10) fall back to a
+    rank-normalised version of their raw mia_score.
+    """
+    N = len(mia_scores)
+    gmm_probs = np.full(N, np.nan)
+
+    quantiles  = np.quantile(influence_scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
+    bucket_ids = np.digitize(influence_scores, quantiles)
+
+    for b in range(num_buckets):
+        idx = np.where(bucket_ids == b)[0]
+        if len(idx) < 10:
+            # fallback: rank-normalise raw scores within this tiny bucket
+            ranks = np.argsort(np.argsort(mia_scores[idx])).astype(float)
+            gmm_probs[idx] = ranks / max(len(idx) - 1, 1)
+            continue
+
+        X = mia_scores[idx].reshape(-1, 1)
+        gmm = GaussianMixture(n_components=2, random_state=0)
+        gmm.fit(X)
+
+        # IN component = higher mean
+        in_component = int(np.argmax(gmm.means_.ravel()))
+
+        # P(IN | x) for each point in this bucket
+        probs = gmm.predict_proba(X)[:, in_component]
+        gmm_probs[idx] = probs
+
+    return gmm_probs
 
 
 # ---------------------------------------------------------------------------
@@ -432,10 +476,27 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
     _plot_bucket_tpr_comparison(scores_dict, mia_scores, ground_truth, out_dir, num_buckets)
 
     # ------------------------------------------------------------------
-    # 6. Save analysis outputs
+    # 6. Bucket-wise GMM aggregation → global MIA
+    # ------------------------------------------------------------------
+    print("\nRunning bucket-wise GMM aggregation (C_lira buckets)...")
+    gmm_probs = _gmm_aggregate_mia_scores(scores_C_lira, mia_scores, num_buckets)
+
+    fpr_gmm, tpr_gmm, _ = roc_curve(ground_truth.astype(int), gmm_probs)
+    tpr_0pct_gmm  = _tpr_at_fpr(fpr_gmm, tpr_gmm, max_fpr=0.0)
+    tpr_01pct_gmm = _tpr_at_fpr(fpr_gmm, tpr_gmm, max_fpr=0.001)
+    tpr_1pct_gmm  = _tpr_at_fpr(fpr_gmm, tpr_gmm, max_fpr=0.01)
+    bal_acc_gmm   = _balanced_accuracy_from_roc(fpr_gmm, tpr_gmm)
+    print(f"  GMM-aggregated MIA: TPR@0%FPR={tpr_0pct_gmm*100:.2f}%, "
+          f"TPR@0.1%FPR={tpr_01pct_gmm*100:.2f}%, "
+          f"TPR@1%FPR={tpr_1pct_gmm*100:.2f}%, "
+          f"Balanced Acc={bal_acc_gmm*100:.2f}%")
+
+    # ------------------------------------------------------------------
+    # 7. Save analysis outputs
     # ------------------------------------------------------------------
     save_dict = dict(
         mia_scores=mia_scores,
+        gmm_probs=gmm_probs,
         ground_truth=ground_truth,
         scores_C_lira=scores_C_lira,
         query_pool_indices=query_pool_indices,
@@ -450,10 +511,14 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
     print(f"\n{'='*60}")
     print("RESULTS")
     print(f"{'='*60}")
-    print(f"  MIA: TPR@0%FPR={tpr_0pct_all*100:.2f}%  "
+    print(f"  MIA (raw):         TPR@0%FPR={tpr_0pct_all*100:.2f}%  "
           f"TPR@0.1%FPR={tpr_01pct_all*100:.2f}%  "
           f"TPR@1%FPR={tpr_1pct_all*100:.2f}%  "
           f"Balanced Acc={bal_acc_all*100:.2f}%")
+    print(f"  MIA (GMM-bucketed):TPR@0%FPR={tpr_0pct_gmm*100:.2f}%  "
+          f"TPR@0.1%FPR={tpr_01pct_gmm*100:.2f}%  "
+          f"TPR@1%FPR={tpr_1pct_gmm*100:.2f}%  "
+          f"Balanced Acc={bal_acc_gmm*100:.2f}%")
     print(f"{'='*60}\n")
 
 
