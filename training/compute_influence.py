@@ -226,10 +226,8 @@ def compute_influence(args, shadow_id, device):
       lira_stats[i]  →  query_indices[i]
       C_lira[i]      →  query_indices[i]
       C_loss[i]      →  query_indices[i]
-      in_mask[i]     →  query_indices[i]  (written by train_shadow)
     """
     out_dir    = os.path.join(args.exp_dir, "shadows", str(shadow_id))
-    mask_path  = os.path.join(out_dir, "in_mask.npy")
     hinv_path  = os.path.join(out_dir, "H_inv.npy")
     clira_path = os.path.join(out_dir, "C_lira.npy")
     closs_path = os.path.join(out_dir, "C_loss.npy")
@@ -244,17 +242,7 @@ def compute_influence(args, shadow_id, device):
     print(f"[shadow {shadow_id}] Query set size: n_query={n_query}")
 
     # ------------------------------------------------------------------
-    # 2. in_mask alignment check
-    # ------------------------------------------------------------------
-    in_mask = load_array(mask_path).astype(bool)
-    assert in_mask.shape == (n_query,), (
-        f"[shadow {shadow_id}] in_mask shape {in_mask.shape} != (n_query={n_query},). "
-        "Mask was built with a different query set — re-run train_shadow."
-    )
-    print(f"[shadow {shadow_id}] in_mask: IN={in_mask.sum()}, OUT={(~in_mask).sum()}")
-
-    # ------------------------------------------------------------------
-    # 3. Target pool (no aug) — for evaluating the shadow model on D_query
+    # 2. Target pool (no aug) — for evaluating the shadow model on D_query
     # ------------------------------------------------------------------
     target_pool_no_aug = _build_target_pool_no_aug(args)
 
