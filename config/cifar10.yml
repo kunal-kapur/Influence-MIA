@@ -1,0 +1,20 @@
+seed: 42
+model_type: resnet18
+data_dir: "/scratch/scholar/kapur16/data/"
+num_classes: 10
+data_mean: [0.4914, 0.4822, 0.4465]
+data_std:  [0.2023, 0.1994, 0.2010]
+lr: 0.001                 # was 0.01
+optimizer: sgd
+momentum: 0.9
+weight_decay: 0.0005
+lr_schedule: cosine      # you can keep cosine or switch to 'step'
+step_milestones: [60, 80]
+step_gamma: 0.1
+epochs: 80
+warmup_epochs: 60
+batch_size: 128          # was 256
+pkeep: 0.5
+num_workers: 2           # was 4, to match the system’s suggestion
+n_shadow_models: 32
+imitate_acc: 0.6         # kept for compatibility, not used in non-adaptive training
