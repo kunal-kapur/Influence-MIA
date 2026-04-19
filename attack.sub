@@ -17,7 +17,7 @@ DATASET="cifar10"
 OUTPUT_DIR="/scratch/scholar/kapur16/data/outputs/"
 DEVICE="cuda"
 CUDA=0
-EXP_NAME="/scratch/scholar/kapur16/imia_run2"
+EXP_NAME="/scratch/scholar/kapur16/imia_run3_pivot"
 
 if [[ "${DEVICE}" == "cpu" ]]; then
     CUDA=-1

@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader, Subset, random_split
 from data import load_dataset
 from models import ResNet18_Influence
 from training.trainer import train_one_epoch, evaluate, build_optimizer, build_scheduler
+from training.plot_training import plot_target_curves
 from utils import save_model, save_array
 
 
@@ -110,6 +111,13 @@ def train_target(args, device):
     best_val_acc = 0.0
     start_epoch  = 1
 
+    history = {
+        "train_loss": [],
+        "train_acc":  [],
+        "val_loss":   [],  # list of (epoch, value)
+        "val_acc":    [],  # list of (epoch, value)
+    }
+
     # ------------------------------------------------------------------
     # 6. Resume from checkpoint if one exists
     # ------------------------------------------------------------------
@@ -132,8 +140,13 @@ def train_target(args, device):
         if scheduler is not None:
             scheduler.step()
 
+        history["train_loss"].append(train_loss)
+        history["train_acc"].append(train_acc)
+
         if epoch % eval_interval == 0 or epoch == args.epochs:
             val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+            history["val_loss"].append((epoch, val_loss))
+            history["val_acc"].append((epoch, val_acc))
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 save_model(model, model_path)
@@ -150,6 +163,8 @@ def train_target(args, device):
         save_model(model, model_path)
 
     print(f"[target] Best val accuracy: {best_val_acc:.4f}  Model saved to {model_path}")
+
+    plot_target_curves(history, args.exp_dir)
 
     if os.path.exists(ckpt_path):
         os.remove(ckpt_path)

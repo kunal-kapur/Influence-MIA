@@ -15,6 +15,8 @@ epochs: 80
 warmup_epochs: 60
 batch_size: 256
 pkeep: 0.5
-num_workers: 1
-n_shadow_models: 10
-imitate_acc: 0.6        # kept for compatibility, not used in non-adaptive training
+num_workers: 2
+n_shadow_models: 20
+imitate_acc: 0.6        # quality gate threshold on shadow OUT model val accuracy
+T2: 20                  # Phase 2 (IN model) training epochs
+k_pivot: 100            # pivot instances per class for D_pivot
