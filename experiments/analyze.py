@@ -37,11 +37,120 @@ import torch
 import torchvision
 import torchvision.transforms as transforms
 import yaml
+from scipy.stats import norm
 from sklearn.metrics import roc_curve
-from sklearn.mixture import GaussianMixture
 from torch.utils.data import ConcatDataset, DataLoader, Subset
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+
+# ---------------------------------------------------------------------------
+# Constrained zero-mean / right-shifted 2-component mixture
+# ---------------------------------------------------------------------------
+
+def fit_fixed_zero_rightshift_mixture(
+    x,
+    max_iter=200,
+    tol=1e-6,
+    min_var=1e-4,
+    mu_in_min=0.5,
+    min_pi_in=0.02,
+    reliability_margin=0.25,
+):
+    """Fit a constrained 1D mixture:
+
+        p(x) = pi_out * N(x; 0, var_out) + pi_in * N(x; mu_in, var_in)
+
+    mu_out is fixed at 0.  mu_in is clamped to >= mu_in_min after each M-step.
+    Returns a dict with posteriors, parameters, convergence flag, reliability
+    flag, and the posterior-equality threshold.
+    """
+    x = np.asarray(x, dtype=float)
+    N = len(x)
+
+    # --- initialise ---
+    mu_in  = max(float(np.percentile(x, 75)), mu_in_min)
+    var_out = max(float(np.var(x)) * 0.5, min_var)
+    var_in  = max(float(np.var(x)) * 0.5, min_var)
+    pi_out  = 0.5
+    pi_in   = 0.5
+
+    prev_loglik = -np.inf
+    converged   = False
+
+    for _ in range(max_iter):
+        # E-step
+        log_p_out = np.log(pi_out + 1e-300) + norm.logpdf(x, 0.0, np.sqrt(var_out))
+        log_p_in  = np.log(pi_in  + 1e-300) + norm.logpdf(x, mu_in, np.sqrt(var_in))
+
+        log_sum = np.logaddexp(log_p_out, log_p_in)
+        r_out   = np.exp(log_p_out - log_sum)
+        r_in    = 1.0 - r_out
+
+        loglik = float(log_sum.sum())
+
+        # M-step
+        n_out = r_out.sum()
+        n_in  = r_in.sum()
+        total = n_out + n_in
+
+        pi_out = n_out / total
+        pi_in  = n_in  / total
+
+        # mu_out stays 0; update mu_in, clamp
+        mu_in_unconstrained = float(np.dot(r_in, x) / (n_in + 1e-300))
+        mu_in = max(mu_in_unconstrained, mu_in_min)
+
+        var_out = max(float(np.dot(r_out, x ** 2) / (n_out + 1e-300)), min_var)
+        var_in  = max(float(np.dot(r_in, (x - mu_in) ** 2) / (n_in + 1e-300)), min_var)
+
+        if abs(loglik - prev_loglik) < tol:
+            converged = True
+            break
+        prev_loglik = loglik
+
+    # --- posterior-equality threshold (pi_out*N(t;0,s_out) == pi_in*N(t;mu_in,s_in)) ---
+    # Solve analytically by scanning the grid (closed form is messy with unequal variances)
+    t_grid = np.linspace(0.0, mu_in * 2.5, 2000)
+    d_out  = pi_out * norm.pdf(t_grid, 0.0, np.sqrt(var_out))
+    d_in   = pi_in  * norm.pdf(t_grid, mu_in, np.sqrt(var_in))
+    sign_changes = np.where(np.diff(np.sign(d_in - d_out)))[0]
+    threshold = None
+    if len(sign_changes) > 0:
+        i = sign_changes[0]
+        # linear interpolation
+        f0 = (d_in - d_out)[i]
+        f1 = (d_in - d_out)[i + 1]
+        threshold = float(t_grid[i] - f0 * (t_grid[i + 1] - t_grid[i]) / (f1 - f0))
+
+    # --- reliability ---
+    reliable = True
+    reason   = "ok"
+    if mu_in <= mu_in_min + reliability_margin:
+        reliable = False
+        reason   = f"mu_in={mu_in:.3f} too close to mu_in_min={mu_in_min}"
+    elif pi_in < min_pi_in:
+        reliable = False
+        reason   = f"pi_in={pi_in:.3f} < min_pi_in={min_pi_in}"
+    elif var_out <= min_var * 2 or var_in <= min_var * 2:
+        reliable = False
+        reason   = f"variance degenerate (var_out={var_out:.4f}, var_in={var_in:.4f})"
+
+    return {
+        "pi_out":       pi_out,
+        "pi_in":        pi_in,
+        "mu_out":       0.0,
+        "mu_in":        mu_in,
+        "var_out":      var_out,
+        "var_in":       var_in,
+        "posterior_in":  r_in,
+        "posterior_out": r_out,
+        "loglik":       loglik,
+        "converged":    converged,
+        "reliable":     reliable,
+        "reason":       reason,
+        "threshold":    threshold,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -229,16 +338,11 @@ def _gmm_aggregate_mia_scores(
     mia_scores: np.ndarray,
     num_buckets: int = 10,
 ) -> np.ndarray:
-    """Bucket-wise GMM aggregation of MIA scores with BIC-based model selection.
+    """Bucket-wise constrained-mixture aggregation of MIA scores.
 
-    For each influence bucket, fits both a 1-component and 2-component GMM and
-    uses BIC to decide which is appropriate:
-      - BIC(1) <= BIC(2): no separable signal; assign p_in = 0.5 for all points.
-      - BIC(2) <  BIC(1): separable IN/OUT distributions; extract P(IN) via the
-                           component with the higher mean.
-
-    Points in buckets too small to fit a GMM (< 10) fall back to a
-    rank-normalised version of their raw mia_score.
+    Uses fit_fixed_zero_rightshift_mixture per bucket.  If the fit is not
+    reliable, falls back to 0.5 (uncertain).  Buckets too small (< 10) fall
+    back to rank-normalised raw scores.
     """
     N = len(mia_scores)
     gmm_probs = np.full(N, np.nan)
@@ -249,41 +353,25 @@ def _gmm_aggregate_mia_scores(
     for b in range(num_buckets):
         idx = np.where(bucket_ids == b)[0]
         if len(idx) < 10:
-            # fallback: rank-normalise raw scores within this tiny bucket
             ranks = np.argsort(np.argsort(mia_scores[idx])).astype(float)
             gmm_probs[idx] = ranks / max(len(idx) - 1, 1)
             continue
 
-        X = mia_scores[idx].reshape(-1, 1)
-        gmm_1 = GaussianMixture(n_components=1, reg_covar=1e-3, random_state=0).fit(X)
-        gmm_2 = GaussianMixture(n_components=2, reg_covar=1e-3, random_state=0).fit(X)
-
-        mean_1 = float(gmm_1.means_.ravel()[0])
-        sd_1 = float(np.sqrt(gmm_1.covariances_.reshape(-1)[0]))
-
-        means_2 = gmm_2.means_.ravel()
-        sds_2 = np.sqrt(gmm_2.covariances_.reshape(-1))
-        in_component = int(np.argmax(means_2))
-        out_component = 1 - in_component
-
-        in_mean = float(means_2[in_component])
-        in_sd = float(sds_2[in_component])
-        out_mean = float(means_2[out_component])
-        out_sd = float(sds_2[out_component])
-
+        fit = fit_fixed_zero_rightshift_mixture(mia_scores[idx])
         print(
             f"  [Bucket {b}] n={len(idx)}: "
-            f"GMM1 mean={mean_1:.3f}, sd={sd_1:.3f}; "
-            f"GMM2 IN mean={in_mean:.3f}, sd={in_sd:.3f}; "
-            f"OUT mean={out_mean:.3f}, sd={out_sd:.3f}"
+            f"mu_in={fit['mu_in']:.3f}  "
+            f"sd_out={np.sqrt(fit['var_out']):.3f}  "
+            f"sd_in={np.sqrt(fit['var_in']):.3f}  "
+            f"pi_in={fit['pi_in']:.3f}  "
+            f"reliable={fit['reliable']}  "
+            f"converged={fit['converged']}"
         )
-
-        if gmm_1.bic(X) <= gmm_2.bic(X):
-            print(f"  [Bucket {b}] BIC favours 1-component — defaulting to p_in=0.5 "
-                  f"(no separable membership signal, n={len(idx)})")
+        if not fit["reliable"]:
+            print(f"    -> unreliable: {fit['reason']} — defaulting to p_in=0.5")
             gmm_probs[idx] = 0.5
         else:
-            gmm_probs[idx] = gmm_2.predict_proba(X)[:, in_component]
+            gmm_probs[idx] = fit["posterior_in"]
 
     return gmm_probs
 
@@ -377,16 +465,12 @@ def _plot_score_vs_mia(score_name, scores, mia_scores, ground_truth, out_dir):
 
 def _plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, out_dir,
                                 num_buckets=10, min_points=10):
-    """Plot one fitted GMM per influence bucket and save each plot separately.
+    """Plot one fitted constrained mixture per influence bucket.
 
-    Each bucket plot shows:
-    - the member vs non-member score distributions inside the bucket,
-    - the fitted 2-component GMM density,
-    - each individual Gaussian component density,
-    - vertical markers at the component means.
-
-    The plots are written to a dedicated subdirectory so each bucket can be
-    inspected independently.
+    Each bucket plot shows histograms for members / non-members, the total
+    mixture density, the OUT component (mean fixed at 0), the IN component
+    (mean > 0), vertical lines at 0 and mu_in, and (optionally) the
+    posterior-equality threshold.  Unreliable fits are flagged in the title.
     """
     bucket_plot_dir = os.path.join(out_dir, "gmm_bucket_components")
     os.makedirs(bucket_plot_dir, exist_ok=True)
@@ -411,61 +495,44 @@ def _plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, out_
             score_min -= 0.5
             score_max += 0.5
 
-        x_grid = np.linspace(score_min, score_max, 300)
+        # extend grid to comfortably show the zero-mean OUT component
+        grid_lo = min(score_min, -3.0 * np.sqrt(float(np.var(bucket_scores))))
+        grid_hi = max(score_max, 1.0)
+        x_grid = np.linspace(grid_lo, grid_hi, 400)
 
         fig, ax = plt.subplots(figsize=(7.2, 4.8))
 
         if len(idx) >= min_points:
-            X = bucket_scores.reshape(-1, 1)
-            gmm_1 = GaussianMixture(n_components=1, reg_covar=1e-3, random_state=0).fit(X)
-            gmm_2 = GaussianMixture(n_components=2, reg_covar=1e-3, random_state=0).fit(X)
+            fit = fit_fixed_zero_rightshift_mixture(bucket_scores)
+            thr_str = f"{fit['threshold']:.3f}" if fit["threshold"] is not None else "none"
+            print(
+                f"  [Bucket {b}] n={len(idx)}: "
+                f"mu_in={fit['mu_in']:.3f}  "
+                f"sd_out={np.sqrt(fit['var_out']):.3f}  "
+                f"sd_in={np.sqrt(fit['var_in']):.3f}  "
+                f"pi_in={fit['pi_in']:.3f}  "
+                f"threshold={thr_str}  "
+                f"reliable={fit['reliable']}  converged={fit['converged']}"
+            )
+            if not fit["reliable"]:
+                print(f"    -> unreliable: {fit['reason']}")
 
-            if gmm_1.bic(X) <= gmm_2.bic(X):
-                # No separable signal — show the 1-component fit, assign p_in=0.5
-                gmm = gmm_1
-                weights = gmm.weights_.ravel()
-                means = gmm.means_.ravel()
-                variances = gmm.covariances_.reshape(-1)
-                component_pdfs = []
-                for component_id in range(1):
-                    var = float(max(variances[component_id], 1e-6))
-                    mean = float(means[component_id])
-                    weight = float(weights[component_id])
-                    pdf = weight * (1.0 / np.sqrt(2.0 * np.pi * var)) * np.exp(-0.5 * ((x_grid - mean) ** 2) / var)
-                    component_pdfs.append(pdf)
-                total_pdf = np.sum(component_pdfs, axis=0)
-                in_component = None
-                p_in = np.full(len(idx), 0.5)
-                p_out = np.full(len(idx), 0.5)
-            else:
-                gmm = gmm_2
-                weights = gmm.weights_.ravel()
-                means = gmm.means_.ravel()
-                variances = gmm.covariances_.reshape(-1)
-                component_pdfs = []
-                for component_id in range(2):
-                    var = float(max(variances[component_id], 1e-6))
-                    mean = float(means[component_id])
-                    weight = float(weights[component_id])
-                    pdf = weight * (1.0 / np.sqrt(2.0 * np.pi * var)) * np.exp(-0.5 * ((x_grid - mean) ** 2) / var)
-                    component_pdfs.append(pdf)
-                total_pdf = np.sum(component_pdfs, axis=0)
-                in_component = int(np.argmax(means))
-                posterior = gmm.predict_proba(X)
-                p_in = posterior[:, in_component]
-                p_out = 1.0 - p_in
+            pdf_out   = fit["pi_out"] * norm.pdf(x_grid, 0.0, np.sqrt(fit["var_out"]))
+            pdf_in    = fit["pi_in"]  * norm.pdf(x_grid, fit["mu_in"], np.sqrt(fit["var_in"]))
+            total_pdf = pdf_out + pdf_in
+
+            p_in  = fit["posterior_in"]
+            p_out = fit["posterior_out"]
         else:
-            gmm = None
+            fit       = None
             total_pdf = None
-            component_pdfs = []
-            means = np.array([])
-            in_component = None
-            p_in = np.full(len(idx), np.nan, dtype=float)
+            pdf_out   = None
+            pdf_in    = None
+            p_in  = np.full(len(idx), np.nan, dtype=float)
             p_out = np.full(len(idx), np.nan, dtype=float)
-
             if len(idx) > 0:
                 ranks = np.argsort(np.argsort(bucket_scores)).astype(float)
-                p_in = ranks / max(len(idx) - 1, 1)
+                p_in  = ranks / max(len(idx) - 1, 1)
                 p_out = 1.0 - p_in
 
         predicted_is_in = p_in >= 0.5
@@ -477,23 +544,31 @@ def _plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, out_
                 color="steelblue", label="in / member")
 
         if total_pdf is not None:
-            ax.plot(x_grid, total_pdf, color="black", linewidth=2.0, label="GMM total")
-            component_colors = ["darkorange", "purple"]
-            for component_id, pdf in enumerate(component_pdfs):
-                label = f"Gaussian {component_id + 1}"
-                if in_component is not None and component_id == in_component:
-                    label += " (higher mean / IN)"
-                ax.plot(x_grid, pdf, linestyle="--", linewidth=1.8,
-                        color=component_colors[component_id], label=label)
-                ax.axvline(float(means[component_id]), color=component_colors[component_id],
-                           linestyle=":", linewidth=1.0)
-        else:
-            ax.text(0.5, 0.9, "Too few points for GMM", transform=ax.transAxes,
-                    ha="center", va="top", fontsize=9)
+            ax.plot(x_grid, total_pdf, color="black",      linewidth=2.0, label="mixture total")
+            ax.plot(x_grid, pdf_out,   color="darkorange",  linewidth=1.8,
+                    linestyle="--", label=f"OUT  μ=0  σ={np.sqrt(fit['var_out']):.2f}")
+            ax.plot(x_grid, pdf_in,    color="purple",      linewidth=1.8,
+                    linestyle="--", label=f"IN   μ={fit['mu_in']:.2f}  σ={np.sqrt(fit['var_in']):.2f}")
 
-        ax.set_title(
-            f"Bucket {b}  n={len(idx)}  in={int(bucket_members.sum())}  out={int(bucket_non_members.sum())}"
+            ax.axvline(0.0,           color="darkorange", linestyle=":", linewidth=1.2)
+            ax.axvline(fit["mu_in"],  color="purple",     linestyle=":", linewidth=1.2)
+
+            if fit["threshold"] is not None:
+                ax.axvline(fit["threshold"], color="gray", linestyle="-.", linewidth=1.0,
+                           label=f"threshold={fit['threshold']:.2f}")
+
+            reliability_tag = "" if fit["reliable"] else f"  [UNRELIABLE: {fit['reason']}]"
+        else:
+            ax.text(0.5, 0.9, "Too few points for mixture", transform=ax.transAxes,
+                    ha="center", va="top", fontsize=9)
+            reliability_tag = ""
+
+        title = (
+            f"Bucket {b}  n={len(idx)}  "
+            f"in={int(bucket_members.sum())}  out={int(bucket_non_members.sum())}"
+            + reliability_tag
         )
+        ax.set_title(title, fontsize=8 if reliability_tag else 10)
         ax.set_xlabel("MIA score")
         ax.set_ylabel("Density")
         ax.legend(fontsize=8, loc="best")
@@ -503,19 +578,25 @@ def _plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, out_
         fig.savefig(out_path, dpi=120)
         plt.close(fig)
 
-        bic_n_components = 1 if in_component is None and len(idx) >= min_points else (2 if len(idx) >= min_points else None)
+        mu_in_val   = float(fit["mu_in"])  if fit else float("nan")
+        pi_in_val   = float(fit["pi_in"])  if fit else float("nan")
+        reliable    = bool(fit["reliable"]) if fit else False
+        threshold   = fit["threshold"]     if fit else None
         for local_pos, point_idx in enumerate(idx):
             csv_rows.append({
-                "point_index": int(point_idx),
-                "bucket": int(b),
-                "bucket_size": int(len(idx)),
-                "bic_n_components": bic_n_components,
-                "mia_score": float(bucket_scores[local_pos]),
-                "ground_truth": int(ground_truth[point_idx]),
+                "point_index":    int(point_idx),
+                "bucket":         int(b),
+                "bucket_size":    int(len(idx)),
+                "mu_in":          mu_in_val,
+                "pi_in":          pi_in_val,
+                "reliable":       reliable,
+                "threshold":      float(threshold) if threshold is not None else float("nan"),
+                "mia_score":      float(bucket_scores[local_pos]),
+                "ground_truth":   int(ground_truth[point_idx]),
                 "ground_truth_label": "in" if ground_truth[point_idx] == 1 else "out",
                 "predicted_label": "in" if bool(predicted_is_in[local_pos]) else "out",
-                "p_in": float(p_in[local_pos]),
-                "p_out": float(p_out[local_pos]),
+                "p_in":           float(p_in[local_pos]),
+                "p_out":          float(p_out[local_pos]),
             })
 
     csv_rows.sort(key=lambda row: (row["bucket"], row["mia_score"], row["point_index"]))
@@ -527,7 +608,10 @@ def _plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, out_
                 "point_index",
                 "bucket",
                 "bucket_size",
-                "bic_n_components",
+                "mu_in",
+                "pi_in",
+                "reliable",
+                "threshold",
                 "mia_score",
                 "ground_truth",
                 "ground_truth_label",
