@@ -17,7 +17,7 @@ DATASET="cifar10"
 OUTPUT_DIR="/scratch/scholar/kapur16/data/outputs/"
 DEVICE="cuda"
 CUDA=0
-EXP_NAME="/scratch/scholar/kapur16/imia_cifar10_run1"
+EXP_NAME="/scratch/scholar/kapur16/imia_run2"
 
 if [[ "${DEVICE}" == "cpu" ]]; then
     CUDA=-1
@@ -34,4 +34,4 @@ srun --unbuffered python -u -m experiments.run_experiment \
     --output_dir ${OUTPUT_DIR} \
     --cuda       ${CUDA} \
     --exp_name   ${EXP_NAME} \
-    --num_buckets 10
+    --num_buckets 20

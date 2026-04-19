@@ -23,6 +23,7 @@ python -m experiments.analyze --exp_dir outputs/<exp_name>/cifar10 --num_buckets
 """
 
 import argparse
+import csv
 import os
 import sys
 import types
@@ -36,10 +37,120 @@ import torch
 import torchvision
 import torchvision.transforms as transforms
 import yaml
+from scipy.stats import norm
 from sklearn.metrics import roc_curve
 from torch.utils.data import ConcatDataset, DataLoader, Subset
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+
+# ---------------------------------------------------------------------------
+# Constrained zero-mean / right-shifted 2-component mixture
+# ---------------------------------------------------------------------------
+
+def fit_fixed_zero_rightshift_mixture(
+    x,
+    max_iter=200,
+    tol=1e-6,
+    min_var=1e-4,
+    mu_in_min=0.5,
+    min_pi_in=0.02,
+    reliability_margin=0.25,
+):
+    """Fit a constrained 1D mixture:
+
+        p(x) = pi_out * N(x; 0, var_out) + pi_in * N(x; mu_in, var_in)
+
+    mu_out is fixed at 0.  mu_in is clamped to >= mu_in_min after each M-step.
+    Returns a dict with posteriors, parameters, convergence flag, reliability
+    flag, and the posterior-equality threshold.
+    """
+    x = np.asarray(x, dtype=float)
+    N = len(x)
+
+    # --- initialise ---
+    mu_in  = max(float(np.percentile(x, 75)), mu_in_min)
+    var_out = max(float(np.var(x)) * 0.5, min_var)
+    var_in  = max(float(np.var(x)) * 0.5, min_var)
+    pi_out  = 0.5
+    pi_in   = 0.5
+
+    prev_loglik = -np.inf
+    converged   = False
+
+    for _ in range(max_iter):
+        # E-step
+        log_p_out = np.log(pi_out + 1e-300) + norm.logpdf(x, 0.0, np.sqrt(var_out))
+        log_p_in  = np.log(pi_in  + 1e-300) + norm.logpdf(x, mu_in, np.sqrt(var_in))
+
+        log_sum = np.logaddexp(log_p_out, log_p_in)
+        r_out   = np.exp(log_p_out - log_sum)
+        r_in    = 1.0 - r_out
+
+        loglik = float(log_sum.sum())
+
+        # M-step
+        n_out = r_out.sum()
+        n_in  = r_in.sum()
+        total = n_out + n_in
+
+        pi_out = n_out / total
+        pi_in  = n_in  / total
+
+        # mu_out stays 0; update mu_in, clamp
+        mu_in_unconstrained = float(np.dot(r_in, x) / (n_in + 1e-300))
+        mu_in = max(mu_in_unconstrained, mu_in_min)
+
+        var_out = max(float(np.dot(r_out, x ** 2) / (n_out + 1e-300)), min_var)
+        var_in  = max(float(np.dot(r_in, (x - mu_in) ** 2) / (n_in + 1e-300)), min_var)
+
+        if abs(loglik - prev_loglik) < tol:
+            converged = True
+            break
+        prev_loglik = loglik
+
+    # --- posterior-equality threshold (pi_out*N(t;0,s_out) == pi_in*N(t;mu_in,s_in)) ---
+    # Solve analytically by scanning the grid (closed form is messy with unequal variances)
+    t_grid = np.linspace(0.0, mu_in * 2.5, 2000)
+    d_out  = pi_out * norm.pdf(t_grid, 0.0, np.sqrt(var_out))
+    d_in   = pi_in  * norm.pdf(t_grid, mu_in, np.sqrt(var_in))
+    sign_changes = np.where(np.diff(np.sign(d_in - d_out)))[0]
+    threshold = None
+    if len(sign_changes) > 0:
+        i = sign_changes[0]
+        # linear interpolation
+        f0 = (d_in - d_out)[i]
+        f1 = (d_in - d_out)[i + 1]
+        threshold = float(t_grid[i] - f0 * (t_grid[i + 1] - t_grid[i]) / (f1 - f0))
+
+    # --- reliability ---
+    reliable = True
+    reason   = "ok"
+    if mu_in <= mu_in_min + reliability_margin:
+        reliable = False
+        reason   = f"mu_in={mu_in:.3f} too close to mu_in_min={mu_in_min}"
+    elif pi_in < min_pi_in:
+        reliable = False
+        reason   = f"pi_in={pi_in:.3f} < min_pi_in={min_pi_in}"
+    elif var_out <= min_var * 2 or var_in <= min_var * 2:
+        reliable = False
+        reason   = f"variance degenerate (var_out={var_out:.4f}, var_in={var_in:.4f})"
+
+    return {
+        "pi_out":       pi_out,
+        "pi_in":        pi_in,
+        "mu_out":       0.0,
+        "mu_in":        mu_in,
+        "var_out":      var_out,
+        "var_in":       var_in,
+        "posterior_in":  r_in,
+        "posterior_out": r_out,
+        "loglik":       loglik,
+        "converged":    converged,
+        "reliable":     reliable,
+        "reason":       reason,
+        "threshold":    threshold,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +333,49 @@ def _aggregate_influence(C_list):
     return np.stack([C_list[k] for k in range(K)], axis=0).mean(axis=0)
 
 
+def _gmm_aggregate_mia_scores(
+    influence_scores: np.ndarray,
+    mia_scores: np.ndarray,
+    num_buckets: int = 10,
+) -> np.ndarray:
+    """Bucket-wise constrained-mixture aggregation of MIA scores.
+
+    Uses fit_fixed_zero_rightshift_mixture per bucket.  If the fit is not
+    reliable, falls back to 0.5 (uncertain).  Buckets too small (< 10) fall
+    back to rank-normalised raw scores.
+    """
+    N = len(mia_scores)
+    gmm_probs = np.full(N, np.nan)
+
+    quantiles  = np.quantile(influence_scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
+    bucket_ids = np.digitize(influence_scores, quantiles)
+
+    for b in range(num_buckets):
+        idx = np.where(bucket_ids == b)[0]
+        if len(idx) < 10:
+            ranks = np.argsort(np.argsort(mia_scores[idx])).astype(float)
+            gmm_probs[idx] = ranks / max(len(idx) - 1, 1)
+            continue
+
+        fit = fit_fixed_zero_rightshift_mixture(mia_scores[idx])
+        print(
+            f"  [Bucket {b}] n={len(idx)}: "
+            f"mu_in={fit['mu_in']:.3f}  "
+            f"sd_out={np.sqrt(fit['var_out']):.3f}  "
+            f"sd_in={np.sqrt(fit['var_in']):.3f}  "
+            f"pi_in={fit['pi_in']:.3f}  "
+            f"reliable={fit['reliable']}  "
+            f"converged={fit['converged']}"
+        )
+        if not fit["reliable"]:
+            print(f"    -> unreliable: {fit['reason']} — defaulting to p_in=0.5")
+            gmm_probs[idx] = 0.5
+        else:
+            gmm_probs[idx] = fit["posterior_in"]
+
+    return gmm_probs
+
+
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
@@ -307,6 +461,170 @@ def _plot_score_vs_mia(score_name, scores, mia_scores, ground_truth, out_dir):
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, f"scatter_{score_name}_vs_mia.png"), dpi=100)
     plt.close(fig)
+
+
+def _plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, out_dir,
+                                num_buckets=10, min_points=10):
+    """Plot one fitted constrained mixture per influence bucket.
+
+    Each bucket plot shows histograms for members / non-members, the total
+    mixture density, the OUT component (mean fixed at 0), the IN component
+    (mean > 0), vertical lines at 0 and mu_in, and (optionally) the
+    posterior-equality threshold.  Unreliable fits are flagged in the title.
+    """
+    bucket_plot_dir = os.path.join(out_dir, "gmm_bucket_components")
+    os.makedirs(bucket_plot_dir, exist_ok=True)
+    csv_rows = []
+    quantiles = np.quantile(influence_scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
+    bucket_ids = np.digitize(influence_scores, quantiles)
+
+    for b in range(num_buckets):
+        idx = np.where(bucket_ids == b)[0]
+        if len(idx) == 0:
+            continue
+
+        bucket_scores = mia_scores[idx]
+        bucket_members = ground_truth[idx] == 1
+        bucket_non_members = ~bucket_members
+        member_scores = bucket_scores[bucket_members]
+        non_member_scores = bucket_scores[bucket_non_members]
+
+        score_min = float(bucket_scores.min())
+        score_max = float(bucket_scores.max())
+        if np.isclose(score_min, score_max):
+            score_min -= 0.5
+            score_max += 0.5
+
+        # extend grid to comfortably show the zero-mean OUT component
+        grid_lo = min(score_min, -3.0 * np.sqrt(float(np.var(bucket_scores))))
+        grid_hi = max(score_max, 1.0)
+        x_grid = np.linspace(grid_lo, grid_hi, 400)
+
+        fig, ax = plt.subplots(figsize=(7.2, 4.8))
+
+        if len(idx) >= min_points:
+            fit = fit_fixed_zero_rightshift_mixture(bucket_scores)
+            thr_str = f"{fit['threshold']:.3f}" if fit["threshold"] is not None else "none"
+            print(
+                f"  [Bucket {b}] n={len(idx)}: "
+                f"mu_in={fit['mu_in']:.3f}  "
+                f"sd_out={np.sqrt(fit['var_out']):.3f}  "
+                f"sd_in={np.sqrt(fit['var_in']):.3f}  "
+                f"pi_in={fit['pi_in']:.3f}  "
+                f"threshold={thr_str}  "
+                f"reliable={fit['reliable']}  converged={fit['converged']}"
+            )
+            if not fit["reliable"]:
+                print(f"    -> unreliable: {fit['reason']}")
+
+            pdf_out   = fit["pi_out"] * norm.pdf(x_grid, 0.0, np.sqrt(fit["var_out"]))
+            pdf_in    = fit["pi_in"]  * norm.pdf(x_grid, fit["mu_in"], np.sqrt(fit["var_in"]))
+            total_pdf = pdf_out + pdf_in
+
+            p_in  = fit["posterior_in"]
+            p_out = fit["posterior_out"]
+        else:
+            fit       = None
+            total_pdf = None
+            pdf_out   = None
+            pdf_in    = None
+            p_in  = np.full(len(idx), np.nan, dtype=float)
+            p_out = np.full(len(idx), np.nan, dtype=float)
+            if len(idx) > 0:
+                ranks = np.argsort(np.argsort(bucket_scores)).astype(float)
+                p_in  = ranks / max(len(idx) - 1, 1)
+                p_out = 1.0 - p_in
+
+        predicted_is_in = p_in >= 0.5
+
+        bins = np.linspace(score_min, score_max, 28)
+        ax.hist(non_member_scores, bins=bins, density=True, alpha=0.45,
+                color="tomato", label="out / non-member")
+        ax.hist(member_scores, bins=bins, density=True, alpha=0.45,
+                color="steelblue", label="in / member")
+
+        if total_pdf is not None:
+            ax.plot(x_grid, total_pdf, color="black",      linewidth=2.0, label="mixture total")
+            ax.plot(x_grid, pdf_out,   color="darkorange",  linewidth=1.8,
+                    linestyle="--", label=f"OUT  μ=0  σ={np.sqrt(fit['var_out']):.2f}")
+            ax.plot(x_grid, pdf_in,    color="purple",      linewidth=1.8,
+                    linestyle="--", label=f"IN   μ={fit['mu_in']:.2f}  σ={np.sqrt(fit['var_in']):.2f}")
+
+            ax.axvline(0.0,           color="darkorange", linestyle=":", linewidth=1.2)
+            ax.axvline(fit["mu_in"],  color="purple",     linestyle=":", linewidth=1.2)
+
+            if fit["threshold"] is not None:
+                ax.axvline(fit["threshold"], color="gray", linestyle="-.", linewidth=1.0,
+                           label=f"threshold={fit['threshold']:.2f}")
+
+            reliability_tag = "" if fit["reliable"] else f"  [UNRELIABLE: {fit['reason']}]"
+        else:
+            ax.text(0.5, 0.9, "Too few points for mixture", transform=ax.transAxes,
+                    ha="center", va="top", fontsize=9)
+            reliability_tag = ""
+
+        title = (
+            f"Bucket {b}  n={len(idx)}  "
+            f"in={int(bucket_members.sum())}  out={int(bucket_non_members.sum())}"
+            + reliability_tag
+        )
+        ax.set_title(title, fontsize=8 if reliability_tag else 10)
+        ax.set_xlabel("MIA score")
+        ax.set_ylabel("Density")
+        ax.legend(fontsize=8, loc="best")
+
+        fig.tight_layout()
+        out_path = os.path.join(bucket_plot_dir, f"bucket_{b:02d}_gmm_components.png")
+        fig.savefig(out_path, dpi=120)
+        plt.close(fig)
+
+        mu_in_val   = float(fit["mu_in"])  if fit else float("nan")
+        pi_in_val   = float(fit["pi_in"])  if fit else float("nan")
+        reliable    = bool(fit["reliable"]) if fit else False
+        threshold   = fit["threshold"]     if fit else None
+        for local_pos, point_idx in enumerate(idx):
+            csv_rows.append({
+                "point_index":    int(point_idx),
+                "bucket":         int(b),
+                "bucket_size":    int(len(idx)),
+                "mu_in":          mu_in_val,
+                "pi_in":          pi_in_val,
+                "reliable":       reliable,
+                "threshold":      float(threshold) if threshold is not None else float("nan"),
+                "mia_score":      float(bucket_scores[local_pos]),
+                "ground_truth":   int(ground_truth[point_idx]),
+                "ground_truth_label": "in" if ground_truth[point_idx] == 1 else "out",
+                "predicted_label": "in" if bool(predicted_is_in[local_pos]) else "out",
+                "p_in":           float(p_in[local_pos]),
+                "p_out":          float(p_out[local_pos]),
+            })
+
+    csv_rows.sort(key=lambda row: (row["bucket"], row["mia_score"], row["point_index"]))
+    csv_path = os.path.join(bucket_plot_dir, "bucket_points_sorted.csv")
+    with open(csv_path, "w", newline="") as csv_file:
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=[
+                "point_index",
+                "bucket",
+                "bucket_size",
+                "mu_in",
+                "pi_in",
+                "reliable",
+                "threshold",
+                "mia_score",
+                "ground_truth",
+                "ground_truth_label",
+                "predicted_label",
+                "p_in",
+                "p_out",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(csv_rows)
+
+    print(f"  Saved bucket-wise GMM component plots to {bucket_plot_dir}")
+    print(f"  Saved sorted bucket-point CSV to {csv_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -432,10 +750,33 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
     _plot_bucket_tpr_comparison(scores_dict, mia_scores, ground_truth, out_dir, num_buckets)
 
     # ------------------------------------------------------------------
-    # 6. Save analysis outputs
+    # 6. Bucket-wise GMM aggregation → global MIA
+    # ------------------------------------------------------------------
+    gmm_bucket_scores = scores_C_loss if scores_C_loss is not None else scores_C_lira
+    gmm_bucket_name = "C_loss" if scores_C_loss is not None else "C_lira"
+    if scores_C_loss is None:
+        print("\nC_loss not available for all shadows; falling back to C_lira for GMM buckets.")
+    print(f"\nRunning bucket-wise GMM aggregation ({gmm_bucket_name} buckets)...")
+    gmm_probs = _gmm_aggregate_mia_scores(gmm_bucket_scores, mia_scores, num_buckets)
+
+    fpr_gmm, tpr_gmm, _ = roc_curve(ground_truth.astype(int), gmm_probs)
+    tpr_0pct_gmm  = _tpr_at_fpr(fpr_gmm, tpr_gmm, max_fpr=0.0)
+    tpr_01pct_gmm = _tpr_at_fpr(fpr_gmm, tpr_gmm, max_fpr=0.001)
+    tpr_1pct_gmm  = _tpr_at_fpr(fpr_gmm, tpr_gmm, max_fpr=0.01)
+    bal_acc_gmm   = _balanced_accuracy_from_roc(fpr_gmm, tpr_gmm)
+    print(f"  GMM-aggregated MIA: TPR@0%FPR={tpr_0pct_gmm*100:.2f}%, "
+          f"TPR@0.1%FPR={tpr_01pct_gmm*100:.2f}%, "
+          f"TPR@1%FPR={tpr_1pct_gmm*100:.2f}%, "
+          f"Balanced Acc={bal_acc_gmm*100:.2f}%")
+
+    _plot_gmm_bucket_components(gmm_bucket_scores, mia_scores, ground_truth, out_dir, num_buckets)
+
+    # ------------------------------------------------------------------
+    # 7. Save analysis outputs
     # ------------------------------------------------------------------
     save_dict = dict(
         mia_scores=mia_scores,
+        gmm_probs=gmm_probs,
         ground_truth=ground_truth,
         scores_C_lira=scores_C_lira,
         query_pool_indices=query_pool_indices,
@@ -450,10 +791,14 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
     print(f"\n{'='*60}")
     print("RESULTS")
     print(f"{'='*60}")
-    print(f"  MIA: TPR@0%FPR={tpr_0pct_all*100:.2f}%  "
+    print(f"  MIA (raw):         TPR@0%FPR={tpr_0pct_all*100:.2f}%  "
           f"TPR@0.1%FPR={tpr_01pct_all*100:.2f}%  "
           f"TPR@1%FPR={tpr_1pct_all*100:.2f}%  "
           f"Balanced Acc={bal_acc_all*100:.2f}%")
+    print(f"  MIA (GMM-bucketed):TPR@0%FPR={tpr_0pct_gmm*100:.2f}%  "
+          f"TPR@0.1%FPR={tpr_01pct_gmm*100:.2f}%  "
+          f"TPR@1%FPR={tpr_1pct_gmm*100:.2f}%  "
+          f"Balanced Acc={bal_acc_gmm*100:.2f}%")
     print(f"{'='*60}\n")
 
 
