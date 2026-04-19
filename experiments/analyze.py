@@ -258,12 +258,31 @@ def _gmm_aggregate_mia_scores(
         gmm_1 = GaussianMixture(n_components=1, reg_covar=1e-3, random_state=0).fit(X)
         gmm_2 = GaussianMixture(n_components=2, reg_covar=1e-3, random_state=0).fit(X)
 
+        mean_1 = float(gmm_1.means_.ravel()[0])
+        sd_1 = float(np.sqrt(gmm_1.covariances_.reshape(-1)[0]))
+
+        means_2 = gmm_2.means_.ravel()
+        sds_2 = np.sqrt(gmm_2.covariances_.reshape(-1))
+        in_component = int(np.argmax(means_2))
+        out_component = 1 - in_component
+
+        in_mean = float(means_2[in_component])
+        in_sd = float(sds_2[in_component])
+        out_mean = float(means_2[out_component])
+        out_sd = float(sds_2[out_component])
+
+        print(
+            f"  [Bucket {b}] n={len(idx)}: "
+            f"GMM1 mean={mean_1:.3f}, sd={sd_1:.3f}; "
+            f"GMM2 IN mean={in_mean:.3f}, sd={in_sd:.3f}; "
+            f"OUT mean={out_mean:.3f}, sd={out_sd:.3f}"
+        )
+
         if gmm_1.bic(X) <= gmm_2.bic(X):
             print(f"  [Bucket {b}] BIC favours 1-component — defaulting to p_in=0.5 "
                   f"(no separable membership signal, n={len(idx)})")
             gmm_probs[idx] = 0.5
         else:
-            in_component = int(np.argmax(gmm_2.means_.ravel()))
             gmm_probs[idx] = gmm_2.predict_proba(X)[:, in_component]
 
     return gmm_probs
