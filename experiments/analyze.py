@@ -752,8 +752,12 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
     # ------------------------------------------------------------------
     # 6. Bucket-wise GMM aggregation → global MIA
     # ------------------------------------------------------------------
-    print("\nRunning bucket-wise GMM aggregation (C_lira buckets)...")
-    gmm_probs = _gmm_aggregate_mia_scores(scores_C_lira, mia_scores, num_buckets)
+    gmm_bucket_scores = scores_C_loss if scores_C_loss is not None else scores_C_lira
+    gmm_bucket_name = "C_loss" if scores_C_loss is not None else "C_lira"
+    if scores_C_loss is None:
+        print("\nC_loss not available for all shadows; falling back to C_lira for GMM buckets.")
+    print(f"\nRunning bucket-wise GMM aggregation ({gmm_bucket_name} buckets)...")
+    gmm_probs = _gmm_aggregate_mia_scores(gmm_bucket_scores, mia_scores, num_buckets)
 
     fpr_gmm, tpr_gmm, _ = roc_curve(ground_truth.astype(int), gmm_probs)
     tpr_0pct_gmm  = _tpr_at_fpr(fpr_gmm, tpr_gmm, max_fpr=0.0)
@@ -765,7 +769,7 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
           f"TPR@1%FPR={tpr_1pct_gmm*100:.2f}%, "
           f"Balanced Acc={bal_acc_gmm*100:.2f}%")
 
-    _plot_gmm_bucket_components(scores_C_lira, mia_scores, ground_truth, out_dir, num_buckets)
+    _plot_gmm_bucket_components(gmm_bucket_scores, mia_scores, ground_truth, out_dir, num_buckets)
 
     # ------------------------------------------------------------------
     # 7. Save analysis outputs
