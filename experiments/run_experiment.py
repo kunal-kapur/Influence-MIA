@@ -24,13 +24,22 @@ from pathlib import Path
 
 import yaml
 import torch
+from data.loader import get_dataset, offline_data_split
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import ConcatDataset
+from models.resnet import ResNet18_Influence
+from utils.io import load_model
 
 # Allow running as a script from the repo root
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import numpy as np
+
 from training.train_target import train_target
 from training.train_shadow import train_shadow
 from training.compute_influence import compute_influence
+from training.select_pivot import select_pivot_data
 from experiments.analyze import run as run_analysis
 
 
@@ -52,6 +61,8 @@ def _load_config(dataset: str) -> types.SimpleNamespace:
     cfg.setdefault("warmup_epochs", 1)
     cfg.setdefault("temperature", 1.0)
     cfg.setdefault("margin_weight", 1.0)
+    cfg.setdefault("T2", 20)
+    cfg.setdefault("k_pivot", 100)
     return types.SimpleNamespace(**cfg)
 
 
@@ -115,6 +126,50 @@ def _parse_args() -> argparse.Namespace:
 # Stage runners
 # ---------------------------------------------------------------------------
 
+def _ensure_pivot(args, device: torch.device) -> np.ndarray:
+    """Compute or load pivot indices (one-time per experiment)."""
+
+    pivot_path = os.path.join(args.exp_dir, "pivot_indices.npy")
+    if os.path.exists(pivot_path):
+        indices = np.load(pivot_path).astype(np.int64)
+        print(f"[pivot] Loaded {len(indices)} pivot indices from {pivot_path}")
+        return indices
+
+    get_dataset(args)
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(args.data_mean, args.data_std),
+    ])
+    train_ds = torchvision.datasets.CIFAR10(
+        root=args.data_dir, train=True, download=True, transform=transform,
+    )
+    test_ds = torchvision.datasets.CIFAR10(
+        root=args.data_dir, train=False, download=True, transform=transform,
+    )
+    shadow_pool_no_aug = offline_data_split(
+        ConcatDataset([train_ds, test_ds]), args.seed, "shadow"
+    )
+
+    target_model = ResNet18_Influence(num_classes=args.num_classes).to(device)
+    target_model = load_model(
+        target_model, os.path.join(args.exp_dir, "target_model.pt"), device
+    )
+    target_model.eval()
+    for p in target_model.parameters():
+        p.requires_grad_(False)
+
+    return select_pivot_data(
+        target_model=target_model,
+        shadow_pool_no_aug=shadow_pool_no_aug,
+        k_per_class=int(getattr(args, "k_pivot", 100)),
+        num_classes=args.num_classes,
+        device=device,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        exp_dir=args.exp_dir,
+    )
+
+
 def _run_target(args, device: torch.device) -> None:
     target_path = os.path.join(args.exp_dir, "target_model.pt")
     if os.path.exists(target_path):
@@ -124,19 +179,22 @@ def _run_target(args, device: torch.device) -> None:
     train_target(args, device)
 
 
-def _run_shadow_one(args, shadow_id: int, device: torch.device) -> None:
+def _run_shadow_one(args, shadow_id: int, device: torch.device,
+                    pivot_indices: np.ndarray) -> None:
     shadow_dir = os.path.join(args.exp_dir, "shadows", str(shadow_id))
-    model_path = os.path.join(shadow_dir, "shadow_model.pt")
-    ckpt_path = os.path.join(shadow_dir, "checkpoint.pt")
-    lira_path = os.path.join(shadow_dir, "lira_stats.npy")
+    out_path   = os.path.join(shadow_dir, "shadow_model_out.pt")
+    in_path    = os.path.join(shadow_dir, "shadow_model_in.pt")
+    ckpt_path  = os.path.join(shadow_dir, "checkpoint.pt")
+    lira_path  = os.path.join(shadow_dir, "lira_stats.npy")
 
     # Train (resume if checkpoint exists, skip if already complete)
-    if os.path.exists(model_path) and not os.path.exists(ckpt_path):
-        print(f"[shadow {shadow_id}] shadow_model.pt already exists — skipping training.")
+    both_done = os.path.exists(out_path) and os.path.exists(in_path)
+    if both_done and not os.path.exists(ckpt_path):
+        print(f"[shadow {shadow_id}] OUT+IN models exist — skipping training.")
     else:
         label = "Resuming" if os.path.exists(ckpt_path) else "Training"
-        print(f"[shadow {shadow_id}] === {label} shadow model ===")
-        train_shadow(args, shadow_id, device)
+        print(f"[shadow {shadow_id}] === {label} shadow model pair ===")
+        train_shadow(args, shadow_id, device, pivot_indices=pivot_indices)
 
     # Influence
     if os.path.exists(lira_path):
@@ -182,9 +240,10 @@ def main() -> None:
             [cli.shadow_id] if cli.shadow_id is not None
             else list(range(args.n_shadow_models))
         )
+        pivot_indices = _ensure_pivot(args, device)
         for sid in shadow_ids:
             print(f"\n{'='*60}\nStage 2: Shadow model {sid} / {args.n_shadow_models - 1}\n{'='*60}")
-            _run_shadow_one(args, sid, device)
+            _run_shadow_one(args, sid, device, pivot_indices=pivot_indices)
             gc.collect()
             if device.type == "cuda":
                 torch.cuda.empty_cache()
