@@ -110,9 +110,11 @@ def _flush_state_dict(state_dict, path, num_classes):
 # ---------------------------------------------------------------------------
 
 def imitation_loss(student_logits, teacher_logits, labels, num_classes):
-    """Weighted MSE on log-softmax outputs (Eq. 2).
+    """Weighted MSE on log-softmax outputs (Eq. 2), normalised by num_classes.
 
     Upweights the true class and the teacher's most-confident wrong class.
+    Dividing by num_classes keeps the loss O(1) regardless of class count,
+    matching the scale of CE loss and preventing LR explosion.
     """
     sqrt_c = num_classes ** 0.5
     w_high = sqrt_c + 1.0 / (num_classes + 2.0 * sqrt_c)
@@ -131,7 +133,7 @@ def imitation_loss(student_logits, teacher_logits, labels, num_classes):
     W.scatter_(1, labels.unsqueeze(1), w_high)
     W.scatter_(1, wrong_class.unsqueeze(1), w_high)
 
-    return (W * (log_s - log_t) ** 2).sum(dim=1).mean()
+    return (W * (log_s - log_t) ** 2).sum(dim=1).mean() / num_classes
 
 
 # ---------------------------------------------------------------------------
@@ -306,12 +308,21 @@ def train_shadow(args, shadow_id, device, pivot_indices=None):
             print(f"[shadow {shadow_id}] Phase1 Epoch [{epoch:3d}/{T1}] "
                   f"({phase_name}) train_loss={epoch_loss:.4f}")
 
-        # Save warmup checkpoint at the END of epoch T_warmup exactly
+        # Save warmup checkpoint at the END of epoch T_warmup exactly,
+        # then reset the LR scheduler so the imitation phase gets a full
+        # cosine cycle over the remaining T1 - T_warmup epochs rather than
+        # the near-zero LR left at the end of the warmup cosine decay.
         if epoch == T_warmup:
             warmup_state_dict = copy.deepcopy(student.cpu().state_dict())
             student.to(device)
             _flush_state_dict(warmup_state_dict, warmup_path, args.num_classes)
             print(f"[shadow {shadow_id}] Warmup checkpoint saved at epoch {epoch}")
+            imitate_epochs = T1 - T_warmup
+            if imitate_epochs > 0 and scheduler is not None:
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=imitate_epochs
+                )
+                print(f"[shadow {shadow_id}] LR scheduler reset for {imitate_epochs} imitation epochs")
 
         # Track best OUT model quality on val set (post-warmup only)
         if epoch > T_warmup:
