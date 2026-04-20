@@ -22,20 +22,19 @@ import sys
 import types
 from pathlib import Path
 
-import yaml
-import torch
-from data.loader import get_dataset, offline_data_split
-import torchvision
-import torchvision.transforms as transforms
-from torch.utils.data import ConcatDataset
-from models.resnet import ResNet18_Influence
-from utils.io import load_model
-
-# Allow running as a script from the repo root
+# Ensure repo root is on the path before any local imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
+import yaml
+import torch
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import ConcatDataset
 
+from data.loader import get_dataset, offline_data_split
+from models.resnet import ResNet18_Influence
+from utils.io import load_model
 from training.train_target import train_target
 from training.train_shadow import train_shadow
 from training.compute_influence import compute_influence

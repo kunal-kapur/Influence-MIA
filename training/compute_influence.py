@@ -261,7 +261,7 @@ def compute_influence(args, shadow_id, device):
         batch_size=args.batch_size,
         shuffle=False,          # must stay False — order defines the index space
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=device.type == "cuda",
     )
 
     # ------------------------------------------------------------------
@@ -279,9 +279,17 @@ def compute_influence(args, shadow_id, device):
     print(f"[shadow {shadow_id}] Shadow training subset size: {train_dataset_size}")
 
     # ------------------------------------------------------------------
-    # 5. Load shadow model
+    # 5. Load shadow model (prefer OUT model, fall back to legacy name)
     # ------------------------------------------------------------------
-    model_path = os.path.join(out_dir, "shadow_model.pt")
+    for candidate in ("shadow_model_out.pt", "shadow_model.pt"):
+        model_path = os.path.join(out_dir, candidate)
+        if os.path.exists(model_path):
+            break
+    else:
+        raise FileNotFoundError(
+            f"[shadow {shadow_id}] No shadow model found in {out_dir}. "
+            "Expected shadow_model_out.pt or shadow_model.pt."
+        )
     model = ResNet18_Influence(num_classes=args.num_classes).to(device)
     model = load_model(model, model_path, device)
     model.eval()
@@ -311,7 +319,7 @@ def compute_influence(args, shadow_id, device):
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=args.num_workers,
-            pin_memory=True,
+            pin_memory=device.type == "cuda",
         )
         print(f"[shadow {shadow_id}] Computing Hessian on {hessian_sample} shadow-IN samples...")
         H_inv = _compute_last_layer_hessian(model, hessian_loader, device, damping=1e-4)
