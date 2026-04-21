@@ -13,6 +13,7 @@ shadows/{shadow_id}/lira_stats.npy  — scaled logits            (n_query,)
 
 import gc
 import os
+from typing import Optional
 
 import numpy as np
 import torch
@@ -41,7 +42,7 @@ def _load_query_indices(exp_dir: str) -> np.ndarray:
     return np.load(path).astype(np.int64)
 
 
-def _load_reserved_indices(exp_dir: str) -> np.ndarray | None:
+def _load_reserved_indices(exp_dir: str) -> Optional[np.ndarray]:
     """Pool-relative indices of the reserved set, shape (n_reserved,).
 
     Returns None if the file is absent (old experiments lack a reserved set).

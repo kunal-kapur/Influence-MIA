@@ -28,6 +28,7 @@ import os
 import sys
 import types
 from pathlib import Path
+from typing import Optional
 
 import matplotlib
 matplotlib.use("Agg")
@@ -158,7 +159,7 @@ def fit_fixed_zero_rightshift_mixture(
 # ---------------------------------------------------------------------------
 
 def _load_shadow_data(exp_dir: str, n_shadow_models: int, n_query: int,
-                      suffix: str = "", n_expected: int | None = None):
+                      suffix: str = "", n_expected: Optional[int] = None):
     """Load per-shadow arrays.
 
     Parameters
