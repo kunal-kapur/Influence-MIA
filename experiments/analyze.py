@@ -157,35 +157,44 @@ def fit_fixed_zero_rightshift_mixture(
 # Load all shadow artifacts
 # ---------------------------------------------------------------------------
 
-def _load_shadow_data(exp_dir: str, n_shadow_models: int, n_query: int):
-    """Load per-shadow arrays aligned to query_indices.
+def _load_shadow_data(exp_dir: str, n_shadow_models: int, n_query: int,
+                      suffix: str = "", n_expected: int | None = None):
+    """Load per-shadow arrays.
+
+    Parameters
+    ----------
+    suffix    : "" for query-set arrays, "_reserved" for reserved-set arrays.
+    n_expected: expected length of each array (defaults to n_query when suffix="").
 
     Returns
     -------
-    lira_stats : list of (n_query,) arrays  — shadow scaled logits
-    C_lira     : list of (n_query,) arrays
-    C_loss     : list of (n_query,) arrays  (None if file absent)
+    lira_stats : list of (N,) arrays  — shadow scaled logits
+    C_lira     : list of (N,) arrays
+    C_loss     : list of (N,) arrays  (None if file absent)
     """
+    if n_expected is None:
+        n_expected = n_query
+
     lira_stats, C_lira, C_loss = [], [], []
     for k in range(n_shadow_models):
         d          = os.path.join(exp_dir, "shadows", str(k))
-        lira_path  = os.path.join(d, "lira_stats.npy")
-        clira_path = os.path.join(d, "C_lira.npy")
-        closs_path = os.path.join(d, "C_loss.npy")
+        lira_path  = os.path.join(d, f"lira_stats{suffix}.npy")
+        clira_path = os.path.join(d, f"C_lira{suffix}.npy")
+        closs_path = os.path.join(d, f"C_loss{suffix}.npy")
 
         if not os.path.exists(lira_path):
-            print(f"  [shadow {k}] lira_stats.npy missing — skipping.")
+            print(f"  [shadow {k}] lira_stats{suffix}.npy missing — skipping.")
             continue
 
         ls = np.load(lira_path)
         cl = np.load(clira_path)
 
-        assert ls.shape == (n_query,), (
-            f"[shadow {k}] lira_stats shape {ls.shape} != (n_query={n_query},). "
-            "Shadow was evaluated on a different query set — re-run compute_influence."
+        assert ls.shape == (n_expected,), (
+            f"[shadow {k}] lira_stats{suffix} shape {ls.shape} != ({n_expected},). "
+            "Shadow was evaluated on a different set — re-run compute_influence."
         )
-        assert cl.shape == (n_query,), (
-            f"[shadow {k}] C_lira shape {cl.shape} != (n_query={n_query},). "
+        assert cl.shape == (n_expected,), (
+            f"[shadow {k}] C_lira{suffix} shape {cl.shape} != ({n_expected},). "
             "Re-run compute_influence for this shadow."
         )
 
@@ -237,19 +246,34 @@ def _load_query_metadata(exp_dir: str):
     return query_pool_indices, ground_truth
 
 
+def _load_reserved_metadata(exp_dir: str):
+    """Load reserved_indices.npy and reserved_ground_truth.npy.
+
+    Returns (None, None) when the files are absent (old experiments).
+    """
+    ri_path = os.path.join(exp_dir, "reserved_indices.npy")
+    rgt_path = os.path.join(exp_dir, "reserved_ground_truth.npy")
+
+    if not os.path.exists(ri_path) or not os.path.exists(rgt_path):
+        return None, None
+
+    reserved_pool_indices = np.load(ri_path).astype(np.int64)
+    reserved_ground_truth = np.load(rgt_path).astype(np.int32)
+
+    assert reserved_pool_indices.shape == reserved_ground_truth.shape
+    return reserved_pool_indices, reserved_ground_truth
+
+
 # ---------------------------------------------------------------------------
-# Target model evaluation on the query set
+# Target model evaluation on an arbitrary set of pool indices
 # ---------------------------------------------------------------------------
 
 def _compute_target_lira_scores(exp_dir: str, cfg: dict,
-                                 query_pool_indices: np.ndarray) -> np.ndarray:
-    """Evaluate the target model on D_query and return scaled logits.
+                                 pool_indices: np.ndarray) -> np.ndarray:
+    """Evaluate the target model on a set of pool points and return scaled logits.
 
-    Returns (n_query,) array of log(p_true / (1 - p_true)).
-
-    The loader iterates over query_pool_indices in order so that output[i]
-    corresponds to query point i — the same ordering used by lira_stats,
-    C_lira, in_mask, and ground_truth.
+    Returns (N,) array of log(p_true / (1 - p_true)) aligned to pool_indices order.
+    Works for both the query set and the reserved set.
     """
     from models.resnet import ResNet18_Influence
     from data.loader import offline_data_split
@@ -287,9 +311,9 @@ def _compute_target_lira_scores(exp_dir: str, cfg: dict,
     # Reconstruct the target pool — must match the seed used during training
     target_pool = offline_data_split(full_dataset, cfg["seed"], "target")
 
-    # Subset to the query points in query_indices order (no shuffling)
-    query_ds = Subset(target_pool, query_pool_indices.tolist())
-    loader   = DataLoader(query_ds, batch_size=256, shuffle=False, num_workers=2)
+    # Subset to the requested points in pool_indices order (no shuffling)
+    ds     = Subset(target_pool, pool_indices.tolist())
+    loader = DataLoader(ds, batch_size=256, shuffle=False, num_workers=2)
 
     scores = []
     with torch.no_grad():
@@ -302,10 +326,9 @@ def _compute_target_lira_scores(exp_dir: str, cfg: dict,
             scores.append(torch.log(p_true / (1.0 - p_true)).cpu().numpy())
 
     result = np.concatenate(scores)
-    n_query = len(query_pool_indices)
-    assert result.shape == (n_query,), (
-        f"Target score array shape {result.shape} != (n_query={n_query},). "
-        "Pool reconstruction or query_indices may be misaligned."
+    assert result.shape == (len(pool_indices),), (
+        f"Target score array shape {result.shape} != ({len(pool_indices)},). "
+        "Pool reconstruction or indices may be misaligned."
     )
     return result
 
@@ -333,33 +356,39 @@ def _aggregate_influence(C_list):
     return np.stack([C_list[k] for k in range(K)], axis=0).mean(axis=0)
 
 
-def _gmm_aggregate_mia_scores(
+def _fit_gmm_buckets(
     influence_scores: np.ndarray,
     mia_scores: np.ndarray,
     num_buckets: int = 10,
-) -> np.ndarray:
-    """Bucket-wise constrained-mixture aggregation of MIA scores.
+):
+    """Phase 1: fit GMM parameters per influence bucket on a calibration set.
 
-    Uses fit_fixed_zero_rightshift_mixture per bucket.  If the fit is not
-    reliable, falls back to 0.5 (uncertain).  Buckets too small (< 10) fall
-    back to rank-normalised raw scores.
+    Returns a list of bucket descriptors (one per bucket) that can be applied
+    to a separate set of points via `_apply_gmm_buckets`.  The bucket
+    boundaries are chosen to maximise TPR@0%FPR on this calibration data
+    (i.e. uniform-quantile split over the calibration influence scores).
+
+    Each descriptor is a dict with keys:
+        quantile_edges  — (num_buckets-1,) edges that define the partition
+        buckets         — list of per-bucket dicts with keys:
+            b, fit_or_none, reliable, reason
     """
-    N = len(mia_scores)
-    gmm_probs = np.full(N, np.nan)
+    quantile_edges = np.quantile(
+        influence_scores, np.linspace(0, 1, num_buckets + 1)[1:-1]
+    )
+    bucket_ids = np.digitize(influence_scores, quantile_edges)
 
-    quantiles  = np.quantile(influence_scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
-    bucket_ids = np.digitize(influence_scores, quantiles)
-
+    buckets = []
     for b in range(num_buckets):
         idx = np.where(bucket_ids == b)[0]
         if len(idx) < 10:
-            ranks = np.argsort(np.argsort(mia_scores[idx])).astype(float)
-            gmm_probs[idx] = ranks / max(len(idx) - 1, 1)
+            buckets.append({"b": b, "fit": None, "reliable": False,
+                            "reason": "too_few_points", "n": len(idx)})
             continue
 
         fit = fit_fixed_zero_rightshift_mixture(mia_scores[idx])
         print(
-            f"  [Bucket {b}] n={len(idx)}: "
+            f"  [Reserved bucket {b}] n={len(idx)}: "
             f"mu_in={fit['mu_in']:.3f}  "
             f"sd_out={np.sqrt(fit['var_out']):.3f}  "
             f"sd_in={np.sqrt(fit['var_in']):.3f}  "
@@ -368,10 +397,58 @@ def _gmm_aggregate_mia_scores(
             f"converged={fit['converged']}"
         )
         if not fit["reliable"]:
-            print(f"    -> unreliable: {fit['reason']} — defaulting to p_in=0.5")
-            gmm_probs[idx] = 0.5
-        else:
-            gmm_probs[idx] = fit["posterior_in"]
+            print(f"    -> unreliable: {fit['reason']}")
+        buckets.append({"b": b, "fit": fit, "reliable": fit["reliable"],
+                        "reason": fit.get("reason", ""), "n": len(idx)})
+
+    return {"quantile_edges": quantile_edges, "buckets": buckets}
+
+
+def _apply_gmm_buckets(
+    bucket_spec: dict,
+    influence_scores: np.ndarray,
+    mia_scores: np.ndarray,
+) -> np.ndarray:
+    """Phase 2: score query points using pre-fitted GMM bucket parameters.
+
+    For each query point, finds its bucket by the pre-computed edges, then
+    applies the bucket's GMM posterior.  Unreliable or absent fits default
+    to rank-normalised raw scores within the bucket.
+    """
+    N = len(mia_scores)
+    gmm_probs = np.full(N, np.nan)
+
+    quantile_edges = bucket_spec["quantile_edges"]
+    buckets        = bucket_spec["buckets"]
+    bucket_ids     = np.digitize(influence_scores, quantile_edges)
+
+    for desc in buckets:
+        b   = desc["b"]
+        idx = np.where(bucket_ids == b)[0]
+        if len(idx) == 0:
+            continue
+
+        if desc["fit"] is None or not desc["reliable"]:
+            reason = desc.get("reason", "unknown")
+            print(f"  [Query bucket {b}] n={len(idx)}: "
+                  f"no reliable GMM ({reason}) — using rank normalisation")
+            ranks = np.argsort(np.argsort(mia_scores[idx])).astype(float)
+            gmm_probs[idx] = ranks / max(len(idx) - 1, 1)
+            continue
+
+        fit = desc["fit"]
+        log_p_out = np.log(fit["pi_out"] + 1e-300) + norm.logpdf(
+            mia_scores[idx], 0.0, np.sqrt(fit["var_out"])
+        )
+        log_p_in  = np.log(fit["pi_in"]  + 1e-300) + norm.logpdf(
+            mia_scores[idx], fit["mu_in"], np.sqrt(fit["var_in"])
+        )
+        log_sum   = np.logaddexp(log_p_out, log_p_in)
+        p_in      = np.exp(log_p_in - log_sum)
+        print(f"  [Query bucket {b}] n={len(idx)}: "
+              f"applying pre-fitted GMM (mu_in={fit['mu_in']:.3f}  "
+              f"pi_in={fit['pi_in']:.3f})")
+        gmm_probs[idx] = p_in
 
     return gmm_probs
 
@@ -696,8 +773,20 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
     nonmembers = int((ground_truth == 0).sum())
     print(f"  n_query={n_query}  members={members}  non-members={nonmembers}")
 
+    # Reserved-set metadata (may be absent for old experiments)
+    reserved_pool_indices, reserved_ground_truth = _load_reserved_metadata(exp_dir)
+    has_reserved = reserved_pool_indices is not None
+    if has_reserved:
+        n_reserved = len(reserved_pool_indices)
+        print(f"  n_reserved={n_reserved}  "
+              f"members={int(reserved_ground_truth.sum())}  "
+              f"non-members={int((reserved_ground_truth == 0).sum())}")
+    else:
+        n_reserved = 0
+        print("  No reserved set found — GMMs will be fitted on query points (legacy mode).")
+
     # ------------------------------------------------------------------
-    # 2. Shadow artifacts — all must have shape (n_query,)
+    # 2. Shadow artifacts — query-set arrays
     # ------------------------------------------------------------------
     print(f"\nLoading {n_shadow_models} shadow models from {exp_dir}/shadows/...")
     lira_stats, C_lira_list, C_loss_list = _load_shadow_data(
@@ -710,12 +799,31 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
         print("  Need at least 2 complete shadows — skipping analysis.")
         return
 
+    # Reserved-set shadow artifacts
+    if has_reserved:
+        print(f"\nLoading reserved-set shadow artifacts...")
+        lira_stats_res, C_lira_list_res, C_loss_list_res = _load_shadow_data(
+            exp_dir, n_shadow_models, n_query=n_query,
+            suffix="_reserved", n_expected=n_reserved,
+        )
+        K_res = len(lira_stats_res)
+        print(f"  Loaded {K_res} shadows with reserved-set artifacts.")
+        if K_res < 2:
+            print("  Fewer than 2 shadows have reserved artifacts — falling back to legacy GMM.")
+            has_reserved = False
+
     # ------------------------------------------------------------------
-    # 3. Target model scores on D_query
+    # 3. Target model scores on D_query (and reserved set if available)
     # ------------------------------------------------------------------
     print("\nEvaluating target model on query set...")
     target_scores = _compute_target_lira_scores(exp_dir, cfg, query_pool_indices)
     print(f"  target_scores: mean={target_scores.mean():.3f}, std={target_scores.std():.3f}")
+
+    if has_reserved:
+        print("\nEvaluating target model on reserved set...")
+        target_scores_res = _compute_target_lira_scores(exp_dir, cfg, reserved_pool_indices)
+        print(f"  reserved target_scores: mean={target_scores_res.mean():.3f}, "
+              f"std={target_scores_res.std():.3f}")
 
     # ------------------------------------------------------------------
     # 4. Expected discrepancy MIA scores
@@ -732,6 +840,9 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
           f"TPR@0.1%FPR={tpr_01pct_all*100:.2f}%, "
           f"TPR@1%FPR={tpr_1pct_all*100:.2f}%, Balanced Acc={bal_acc_all*100:.2f}%")
 
+    if has_reserved:
+        mia_scores_res = _compute_mia_scores(lira_stats_res, target_scores_res)
+
     # ------------------------------------------------------------------
     # 5. Influence scores
     # ------------------------------------------------------------------
@@ -744,6 +855,11 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
     if scores_C_loss is not None:
         scores_dict["C_loss"] = scores_C_loss
 
+    if has_reserved:
+        scores_C_lira_res = _aggregate_influence(C_lira_list_res)
+        has_closs_res     = all(c is not None for c in C_loss_list_res)
+        scores_C_loss_res = _aggregate_influence(C_loss_list_res) if has_closs_res else None
+
     for name, scores in scores_dict.items():
         analyze_score(name, scores, mia_scores, ground_truth, out_dir, num_buckets)
 
@@ -751,13 +867,29 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
 
     # ------------------------------------------------------------------
     # 6. Bucket-wise GMM aggregation → global MIA
+    #    Phase 1: fit GMMs on the reserved set (disjoint from query points).
+    #    Phase 2: apply pre-built bucket parameters to score the query points.
+    #    Falls back to legacy single-pass fitting when no reserved set exists.
     # ------------------------------------------------------------------
     gmm_bucket_scores = scores_C_loss if scores_C_loss is not None else scores_C_lira
-    gmm_bucket_name = "C_loss" if scores_C_loss is not None else "C_lira"
+    gmm_bucket_name   = "C_loss" if scores_C_loss is not None else "C_lira"
     if scores_C_loss is None:
         print("\nC_loss not available for all shadows; falling back to C_lira for GMM buckets.")
-    print(f"\nRunning bucket-wise GMM aggregation ({gmm_bucket_name} buckets)...")
-    gmm_probs = _gmm_aggregate_mia_scores(gmm_bucket_scores, mia_scores, num_buckets)
+
+    if has_reserved:
+        gmm_bucket_scores_res = (
+            scores_C_loss_res if (has_closs_res and scores_C_loss_res is not None)
+            else scores_C_lira_res
+        )
+        print(f"\nPhase 1 — fitting GMM buckets on reserved set ({gmm_bucket_name})...")
+        bucket_spec = _fit_gmm_buckets(gmm_bucket_scores_res, mia_scores_res, num_buckets)
+
+        print(f"\nPhase 2 — scoring query points with pre-built GMM buckets...")
+        gmm_probs = _apply_gmm_buckets(bucket_spec, gmm_bucket_scores, mia_scores)
+    else:
+        print(f"\nLegacy mode — fitting and applying GMM buckets on query set ({gmm_bucket_name})...")
+        bucket_spec = _fit_gmm_buckets(gmm_bucket_scores, mia_scores, num_buckets)
+        gmm_probs   = _apply_gmm_buckets(bucket_spec, gmm_bucket_scores, mia_scores)
 
     fpr_gmm, tpr_gmm, _ = roc_curve(ground_truth.astype(int), gmm_probs)
     tpr_0pct_gmm  = _tpr_at_fpr(fpr_gmm, tpr_gmm, max_fpr=0.0)

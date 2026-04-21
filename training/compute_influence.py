@@ -41,6 +41,17 @@ def _load_query_indices(exp_dir: str) -> np.ndarray:
     return np.load(path).astype(np.int64)
 
 
+def _load_reserved_indices(exp_dir: str) -> np.ndarray | None:
+    """Pool-relative indices of the reserved set, shape (n_reserved,).
+
+    Returns None if the file is absent (old experiments lack a reserved set).
+    """
+    path = os.path.join(exp_dir, "reserved_indices.npy")
+    if not os.path.exists(path):
+        return None
+    return np.load(path).astype(np.int64)
+
+
 def _build_target_pool_no_aug(args):
     """Load the target pool (D) with normalisation only — no augmentation.
 
@@ -226,12 +237,19 @@ def compute_influence(args, shadow_id, device):
       lira_stats[i]  →  query_indices[i]
       C_lira[i]      →  query_indices[i]
       C_loss[i]      →  query_indices[i]
+
+    If reserved_indices.npy exists, identical artifacts are also computed for
+    the reserved set and saved with a _reserved suffix.
     """
     out_dir    = os.path.join(args.exp_dir, "shadows", str(shadow_id))
     hinv_path  = os.path.join(out_dir, "H_inv.npy")
     clira_path = os.path.join(out_dir, "C_lira.npy")
     closs_path = os.path.join(out_dir, "C_loss.npy")
     lira_path  = os.path.join(out_dir, "lira_stats.npy")
+
+    clira_res_path = os.path.join(out_dir, "C_lira_reserved.npy")
+    closs_res_path = os.path.join(out_dir, "C_loss_reserved.npy")
+    lira_res_path  = os.path.join(out_dir, "lira_stats_reserved.npy")
 
     # ------------------------------------------------------------------
     # 1. Query indices — defines the N points all outputs are aligned to
@@ -241,15 +259,27 @@ def compute_influence(args, shadow_id, device):
     n_query = len(query_pool_indices)
     print(f"[shadow {shadow_id}] Query set size: n_query={n_query}")
 
+    reserved_pool_indices = _load_reserved_indices(args.exp_dir)
+    n_reserved = len(reserved_pool_indices) if reserved_pool_indices is not None else 0
+    if reserved_pool_indices is not None:
+        print(f"[shadow {shadow_id}] Reserved set size: n_reserved={n_reserved}")
+    else:
+        print(f"[shadow {shadow_id}] No reserved_indices.npy found — skipping reserved set.")
+
     # ------------------------------------------------------------------
     # 2. Target pool (no aug) — for evaluating the shadow model on D_query
+    #    and the reserved set (both index into the same target pool)
     # ------------------------------------------------------------------
     target_pool_no_aug = _build_target_pool_no_aug(args)
 
+    all_indices = query_pool_indices
+    if reserved_pool_indices is not None:
+        all_indices = np.concatenate([query_pool_indices, reserved_pool_indices])
+
     # Verify pool size matches what query_indices was built against
-    assert len(target_pool_no_aug) >= query_pool_indices.max() + 1, (
+    assert len(target_pool_no_aug) >= all_indices.max() + 1, (
         f"[shadow {shadow_id}] target pool size {len(target_pool_no_aug)} is smaller than "
-        f"max query index {query_pool_indices.max()}. Seed or dataset changed."
+        f"max index {all_indices.max()}. Seed or dataset changed."
     )
 
     # Subset to exactly the query points, in query_indices order
@@ -263,6 +293,18 @@ def compute_influence(args, shadow_id, device):
         num_workers=args.num_workers,
         pin_memory=True,
     )
+
+    if reserved_pool_indices is not None:
+        reserved_ds = Subset(target_pool_no_aug, reserved_pool_indices.tolist())
+        reserved_loader = DataLoader(
+            reserved_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
+    else:
+        reserved_loader = None
 
     # ------------------------------------------------------------------
     # 4. Shadow pool (no aug) — needed for Hessian (shadow's training data)
@@ -353,6 +395,41 @@ def compute_influence(args, shadow_id, device):
         )
         save_array(lira_stats, lira_path)
         print(f"[shadow {shadow_id}] lira_stats saved  shape={lira_stats.shape}")
+
+    # ------------------------------------------------------------------
+    # 9. Reserved set — influence matrices and LiRA stats
+    #    Only computed when reserved_indices.npy exists (new experiments).
+    # ------------------------------------------------------------------
+    if reserved_loader is not None:
+        if os.path.exists(clira_res_path) and os.path.exists(closs_res_path):
+            print(f"[shadow {shadow_id}] Reserved influence matrices already exist, skipping.")
+        else:
+            print(f"[shadow {shadow_id}] Computing influence matrices over reserved set...")
+            C_lira_res, C_loss_res = _compute_influence_matrices(
+                model, reserved_loader, H_inv,
+                train_dataset_size=train_dataset_size,
+                device=device,
+            )
+            assert C_lira_res.shape == (n_reserved,), (
+                f"[shadow {shadow_id}] C_lira_reserved shape {C_lira_res.shape} "
+                f"!= (n_reserved={n_reserved},)"
+            )
+            save_array(C_lira_res, clira_res_path)
+            save_array(C_loss_res, closs_res_path)
+            print(f"[shadow {shadow_id}] C_lira_reserved saved  shape={C_lira_res.shape}")
+            print(f"[shadow {shadow_id}] C_loss_reserved saved  shape={C_loss_res.shape}")
+
+        if os.path.exists(lira_res_path):
+            print(f"[shadow {shadow_id}] lira_stats_reserved already exists, skipping.")
+        else:
+            print(f"[shadow {shadow_id}] Computing LiRA statistics over reserved set...")
+            lira_stats_res = _get_lira_statistics(model, reserved_loader, device)
+            assert lira_stats_res.shape == (n_reserved,), (
+                f"[shadow {shadow_id}] lira_stats_reserved shape {lira_stats_res.shape} "
+                f"!= (n_reserved={n_reserved},)"
+            )
+            save_array(lira_stats_res, lira_res_path)
+            print(f"[shadow {shadow_id}] lira_stats_reserved saved  shape={lira_stats_res.shape}")
 
     del model
     gc.collect()
