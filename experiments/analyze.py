@@ -638,22 +638,38 @@ def analyze_score(score_name, scores, mia_scores, ground_truth, out_dir, num_buc
     quantiles  = np.quantile(scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
     bucket_ids = np.digitize(scores, quantiles)
 
-    print(f"  [{score_name}] Bucketed TPR@0%FPR, TPR@0.1%FPR, TPR@1%FPR and Balanced Acc by quintile:")
+    print(f"  [{score_name}] Bucketed metrics (within-bucket and scan-from-bucket vs full dataset):")
     for b in range(num_buckets):
         idx = np.where(bucket_ids == b)[0]
         if len(idx) < 10:
             print(f"    Bucket {b}: too few points ({len(idx)}), skipping")
             continue
-        fpr, tpr, _ = roc_curve(ground_truth[idx], mia_scores[idx])
-        tpr_0pct  = _tpr_at_fpr(fpr, tpr, max_fpr=0.0)
-        tpr_01pct = _tpr_at_fpr(fpr, tpr, max_fpr=0.001)
-        tpr_1pct  = _tpr_at_fpr(fpr, tpr, max_fpr=0.01)
-        bal_acc   = _balanced_accuracy_from_roc(fpr, tpr)
-        print(f"    Bucket {b}: size={len(idx):4d}, "
-              f"TPR@0%FPR={tpr_0pct*100:5.2f}%, "
-              f"TPR@0.1%FPR={tpr_01pct*100:5.2f}%, "
-              f"TPR@1%FPR={tpr_1pct*100:5.2f}%, "
-              f"Balanced Acc={bal_acc*100:5.2f}%")
+
+        # Within-bucket ROC
+        fpr_b, tpr_b, _ = roc_curve(ground_truth[idx], mia_scores[idx])
+        tpr_0pct_b  = _tpr_at_fpr(fpr_b, tpr_b, max_fpr=0.0)
+        tpr_01pct_b = _tpr_at_fpr(fpr_b, tpr_b, max_fpr=0.001)
+        tpr_1pct_b  = _tpr_at_fpr(fpr_b, tpr_b, max_fpr=0.01)
+        bal_acc_b   = _balanced_accuracy_from_roc(fpr_b, tpr_b)
+
+        # Scan-from-bucket: attacker only audits samples in buckets b..num_buckets-1.
+        # Non-audited samples are predicted non-member regardless of MIA score.
+        # FPR/TPR denominators are still full-dataset member/non-member counts.
+        scan_mask = (bucket_ids >= b)
+        n_members     = int(ground_truth.sum())
+        n_nonmembers  = len(ground_truth) - n_members
+        # Use full-dataset ROC but zero out scores for non-scanned samples so they
+        # rank last (always predicted non-member).
+        masked_scores = np.where(scan_mask, mia_scores, mia_scores.min() - 1.0)
+        fpr_s, tpr_s, _ = roc_curve(ground_truth, masked_scores)
+        tpr_0pct_s  = _tpr_at_fpr(fpr_s, tpr_s, max_fpr=0.0)
+        tpr_01pct_s = _tpr_at_fpr(fpr_s, tpr_s, max_fpr=0.001)
+        tpr_1pct_s  = _tpr_at_fpr(fpr_s, tpr_s, max_fpr=0.01)
+        bal_acc_s   = _balanced_accuracy_from_roc(fpr_s, tpr_s)
+
+        print(f"    Bucket {b}: size={len(idx):4d}")
+        print(f"      [within-bucket ]  TPR@0%FPR={tpr_0pct_b*100:5.2f}%  TPR@0.1%FPR={tpr_01pct_b*100:5.2f}%  TPR@1%FPR={tpr_1pct_b*100:5.2f}%  Balanced Acc={bal_acc_b*100:5.2f}%")
+        print(f"      [scan from b.. ]  TPR@0%FPR={tpr_0pct_s*100:5.2f}%  TPR@0.1%FPR={tpr_01pct_s*100:5.2f}%  TPR@1%FPR={tpr_1pct_s*100:5.2f}%  Balanced Acc={bal_acc_s*100:5.2f}%")
         _plot_bucket_mia_hist(mia_scores, ground_truth, idx, b, out_dir, score_name)
 
     _plot_score_vs_mia(score_name, scores, mia_scores, ground_truth, out_dir)
