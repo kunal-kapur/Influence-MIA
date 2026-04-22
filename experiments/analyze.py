@@ -405,6 +405,64 @@ def _fit_gmm_buckets(
     return {"quantile_edges": quantile_edges, "buckets": buckets}
 
 
+def _score_bucket_count(
+    num_buckets: int,
+    influence_scores: np.ndarray,
+    mia_scores: np.ndarray,
+    ground_truth: np.ndarray,
+) -> float:
+    """Fit+apply GMM bucketing on the same set and return TPR@0%FPR.
+
+    Used only on the reserved set, where ground_truth labels are available,
+    to select the best num_buckets before touching the query set.
+    """
+    spec   = _fit_gmm_buckets(influence_scores, mia_scores, num_buckets)
+    probs  = _apply_gmm_buckets(spec, influence_scores, mia_scores)
+    valid  = ~np.isnan(probs)
+    if valid.sum() < 10:
+        return float("-inf")
+    fpr, tpr, _ = roc_curve(ground_truth[valid].astype(int), probs[valid])
+    return _tpr_at_fpr(fpr, tpr, max_fpr=0.0)
+
+
+def _search_num_buckets(
+    influence_scores: np.ndarray,
+    mia_scores: np.ndarray,
+    ground_truth: np.ndarray,
+    candidates: list[int] | None = None,
+) -> int:
+    """Search over candidate bucket counts using the reserved set.
+
+    Fits and scores each candidate entirely on the reserved set (ground truth
+    available there, and it is disjoint from the query set so no leakage).
+    Returns the num_buckets that maximises TPR@0%FPR on the reserved set.
+
+    candidates defaults to [5, 8, 10, 15, 20, 25, 30, 35, 40].
+    """
+    if candidates is None:
+        candidates = [5, 8, 10, 15, 20, 25, 30, 35, 40]
+
+    # Require at least 10 × num_buckets points so each bucket is non-trivial.
+    n = len(influence_scores)
+    candidates = [k for k in candidates if n >= 10 * k]
+    if not candidates:
+        candidates = [max(1, n // 10)]
+
+    print(f"\n  [Bucket search] evaluating num_buckets in {candidates} "
+          f"(n_reserved={n})...")
+
+    best_k, best_tpr = candidates[0], float("-inf")
+    for k in candidates:
+        tpr = _score_bucket_count(k, influence_scores, mia_scores, ground_truth)
+        print(f"    num_buckets={k:3d}  TPR@0%FPR={tpr*100:.2f}%")
+        if tpr > best_tpr:
+            best_k, best_tpr = k, tpr
+
+    print(f"  [Bucket search] selected num_buckets={best_k} "
+          f"(TPR@0%FPR={best_tpr*100:.2f}% on reserved set)")
+    return best_k
+
+
 def _apply_gmm_buckets(
     bucket_spec: dict,
     influence_scores: np.ndarray,
@@ -747,7 +805,8 @@ def _parse_args():
     parser.add_argument("--exp_dir",     required=True,
                         help="Experiment directory (e.g. outputs/<exp>/cifar10)")
     parser.add_argument("--num_buckets", type=int, default=10,
-                        help="Number of quantile buckets (default: 5 = quintiles)")
+                        help="Fallback number of buckets when no reserved set exists "
+                             "(ignored when reserved set is present — searched automatically)")
     return parser.parse_args()
 
 
@@ -882,8 +941,15 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
             scores_C_loss_res if (has_closs_res and scores_C_loss_res is not None)
             else scores_C_lira_res
         )
-        print(f"\nPhase 1 — fitting GMM buckets on reserved set ({gmm_bucket_name})...")
-        bucket_spec = _fit_gmm_buckets(gmm_bucket_scores_res, mia_scores_res, num_buckets)
+        best_num_buckets = _search_num_buckets(
+            gmm_bucket_scores_res, mia_scores_res, reserved_ground_truth
+        )
+
+        print(f"\nPhase 1 — fitting GMM buckets on reserved set "
+              f"({gmm_bucket_name}, num_buckets={best_num_buckets})...")
+        bucket_spec = _fit_gmm_buckets(
+            gmm_bucket_scores_res, mia_scores_res, best_num_buckets
+        )
 
         print(f"\nPhase 2 — scoring query points with pre-built GMM buckets...")
         gmm_probs = _apply_gmm_buckets(bucket_spec, gmm_bucket_scores, mia_scores)
@@ -902,7 +968,8 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
           f"TPR@1%FPR={tpr_1pct_gmm*100:.2f}%, "
           f"Balanced Acc={bal_acc_gmm*100:.2f}%")
 
-    _plot_gmm_bucket_components(gmm_bucket_scores, mia_scores, ground_truth, out_dir, num_buckets)
+    plot_num_buckets = best_num_buckets if has_reserved else num_buckets
+    _plot_gmm_bucket_components(gmm_bucket_scores, mia_scores, ground_truth, out_dir, plot_num_buckets)
 
     # ------------------------------------------------------------------
     # 7. Save analysis outputs
