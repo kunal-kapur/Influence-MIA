@@ -247,8 +247,9 @@ def _load_model_from_path(model_path: str, device: torch.device):
     return model
 
 
-def _compute_scaled_logit_scores(model, loader, device):
+def _compute_scaled_logit_scores(model, loader, device, return_labels: bool = False):
     scores = []
+    labels = []
     with torch.no_grad():
         for inputs, targets in loader:
             inputs, targets = inputs.to(device), targets.to(device)
@@ -257,10 +258,17 @@ def _compute_scaled_logit_scores(model, loader, device):
             p_true = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
             p_true = torch.clamp(p_true, min=1e-7, max=1.0 - 1e-7)
             scores.append(torch.log(p_true / (1.0 - p_true)).cpu().numpy())
-    return np.concatenate(scores)
+            if return_labels:
+                labels.append(targets.cpu().numpy().astype(np.int32))
+
+    result = np.concatenate(scores)
+    if return_labels:
+        return result, np.concatenate(labels)
+    return result
 
 
-def _compute_target_scores_for_dataset(exp_dir: str, cfg: dict, dataset) -> np.ndarray:
+def _compute_target_scores_for_dataset(exp_dir: str, cfg: dict, dataset,
+                                       return_labels: bool = False):
     target_path = os.path.join(exp_dir, "target_model.pt")
     if not os.path.exists(target_path):
         raise FileNotFoundError(
@@ -275,7 +283,7 @@ def _compute_target_scores_for_dataset(exp_dir: str, cfg: dict, dataset) -> np.n
         shuffle=False,
         num_workers=int(cfg.get("num_workers", 2)),
     )
-    result = _compute_scaled_logit_scores(model, loader, device)
+    result = _compute_scaled_logit_scores(model, loader, device, return_labels=return_labels)
     del model
     return result
 
@@ -444,7 +452,8 @@ def _bucketize_scores(scores: np.ndarray, bucket_edges: np.ndarray) -> np.ndarra
 
 
 def _fit_reference_bucket_gmms(influence_scores: np.ndarray, mia_scores: np.ndarray,
-                               num_buckets: int = 10, min_points: int = 10):
+                               num_buckets: int = 10, min_points: int = 10,
+                               verbose: bool = True):
     bucket_edges = np.quantile(influence_scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
     bucket_ids = _bucketize_scores(influence_scores, bucket_edges)
     fits = []
@@ -452,22 +461,24 @@ def _fit_reference_bucket_gmms(influence_scores: np.ndarray, mia_scores: np.ndar
     for b in range(num_buckets):
         idx = np.where(bucket_ids == b)[0]
         if len(idx) < min_points:
-            print(f"  [Reference bucket {b}] n={len(idx)}: too few points for mixture; using fallback p_in=0.5")
+            if verbose:
+                print(f"  [Reference bucket {b}] n={len(idx)}: too few points for mixture; using fallback p_in=0.5")
             fits.append(None)
             continue
 
         fit = fit_fixed_zero_rightshift_mixture(mia_scores[idx])
-        print(
-            f"  [Reference bucket {b}] n={len(idx)}: "
-            f"mu_in={fit['mu_in']:.3f}  "
-            f"sd_out={np.sqrt(fit['var_out']):.3f}  "
-            f"sd_in={np.sqrt(fit['var_in']):.3f}  "
-            f"pi_in={fit['pi_in']:.3f}  "
-            f"reliable={fit['reliable']}  "
-            f"converged={fit['converged']}"
-        )
-        if not fit["reliable"]:
-            print(f"    -> unreliable: {fit['reason']} — query points in this bucket will default to p_in=0.5")
+        if verbose:
+            print(
+                f"  [Reference bucket {b}] n={len(idx)}: "
+                f"mu_in={fit['mu_in']:.3f}  "
+                f"sd_out={np.sqrt(fit['var_out']):.3f}  "
+                f"sd_in={np.sqrt(fit['var_in']):.3f}  "
+                f"pi_in={fit['pi_in']:.3f}  "
+                f"reliable={fit['reliable']}  "
+                f"converged={fit['converged']}"
+            )
+            if not fit["reliable"]:
+                print(f"    -> unreliable: {fit['reason']} — query points in this bucket will default to p_in=0.5")
         fits.append(fit)
 
     return bucket_edges, bucket_ids, fits
@@ -508,6 +519,248 @@ def _balanced_accuracy_from_roc(fpr, tpr):
 def _tpr_at_fpr(fpr, tpr, max_fpr=0.01):
     valid = np.where(fpr <= max_fpr)[0]
     return float(tpr[valid[-1]]) if len(valid) > 0 else float("nan")
+
+
+def _compute_metrics_from_scores(ground_truth: np.ndarray, scores: np.ndarray):
+    fpr, tpr, _ = roc_curve(ground_truth.astype(int), scores)
+    return {
+        "tpr_0": _tpr_at_fpr(fpr, tpr, max_fpr=0.0),
+        "tpr_01": _tpr_at_fpr(fpr, tpr, max_fpr=0.001),
+        "tpr_1": _tpr_at_fpr(fpr, tpr, max_fpr=0.01),
+        "bal_acc": _balanced_accuracy_from_roc(fpr, tpr),
+    }
+
+
+def _prepare_binary_membership_labels(labels):
+    if labels is None:
+        return None
+    labels = np.asarray(labels).astype(np.int32)
+    uniq = np.unique(labels)
+    if uniq.size == 2 and np.array_equal(uniq, np.array([0, 1], dtype=np.int32)):
+        return labels
+    return None
+
+
+def _compute_unsupervised_fit_quality(bucket_ids: np.ndarray, bucket_fits) -> dict:
+    total = int(len(bucket_ids))
+    if total == 0:
+        return {
+            "fit_quality": float("-inf"),
+            "reliable_fraction": 0.0,
+            "mean_reliable_loglik": float("-inf"),
+        }
+
+    reliable_points = 0
+    reliable_loglik = []
+    for b, fit in enumerate(bucket_fits):
+        n_b = int((bucket_ids == b).sum())
+        if n_b == 0:
+            continue
+        if fit is None or not fit.get("reliable", False):
+            continue
+        reliable_points += n_b
+        reliable_loglik.append(float(fit.get("loglik", float("-inf"))) / max(n_b, 1))
+
+    reliable_fraction = float(reliable_points / total)
+    mean_reliable_loglik = (
+        float(np.mean(reliable_loglik)) if len(reliable_loglik) > 0 else float("-inf")
+    )
+    # Prioritize reliable coverage; log-likelihood is a tie-breaker.
+    fit_quality = reliable_fraction + 1e-3 * mean_reliable_loglik
+    return {
+        "fit_quality": fit_quality,
+        "reliable_fraction": reliable_fraction,
+        "mean_reliable_loglik": mean_reliable_loglik,
+    }
+
+
+def _select_best_reference_bucketing(
+    reference_scores: np.ndarray,
+    reference_mia_scores: np.ndarray,
+    reference_ground_truth,
+    bucket_candidates,
+    selection_metric: str,
+    min_buckets: int = 2,
+    max_buckets: int = 100,
+    max_evals: int = 16,
+    selection_influence_scores: np.ndarray = None,
+    selection_mia_scores: np.ndarray = None,
+    selection_ground_truth: np.ndarray = None,
+):
+    metric_key = {
+        "tpr@0%fpr": "tpr_0",
+        "tpr@0.1%fpr": "tpr_01",
+        "tpr@1%fpr": "tpr_1",
+        "balanced_acc": "bal_acc",
+        "bal_acc": "bal_acc",
+    }.get(str(selection_metric).strip().lower())
+    if metric_key is None and str(selection_metric).strip().lower() not in {"fit_quality", "unsupervised"}:
+        raise ValueError(
+            "gmm_selection_metric must be one of: "
+            "tpr@0%fpr, tpr@0.1%fpr, tpr@1%fpr, balanced_acc, fit_quality"
+        )
+
+    binary_reference_labels = _prepare_binary_membership_labels(reference_ground_truth)
+    binary_selection_labels = _prepare_binary_membership_labels(selection_ground_truth)
+
+    supervised_selection = metric_key is not None and (
+        binary_selection_labels is not None or binary_reference_labels is not None
+    )
+
+    if metric_key is not None and not supervised_selection:
+        print(
+            "  [Reference tune] no binary membership labels available for reference set; "
+            "falling back to unsupervised fit_quality selection."
+        )
+
+    min_buckets = max(2, int(min_buckets))
+    max_avg_safe = max(2, int(len(reference_scores) // 10))
+    max_buckets = min(int(max_buckets), max_avg_safe)
+    if min_buckets > max_buckets:
+        min_buckets = max_buckets
+
+    seed_candidates = sorted(set(int(x) for x in bucket_candidates))
+    seed_candidates = [x for x in seed_candidates if min_buckets <= x <= max_buckets]
+    if not seed_candidates:
+        midpoint = max(min_buckets, min(max_buckets, (min_buckets + max_buckets) // 2))
+        seed_candidates = [midpoint]
+
+    tried = []
+    cache = {}
+    best = None
+    eval_count = 0
+
+    def _evaluate(nb: int):
+        nonlocal best, eval_count
+        nb = int(nb)
+        if nb < min_buckets or nb > max_buckets:
+            return None
+        if nb in cache:
+            return cache[nb]
+        if eval_count >= int(max_evals):
+            return None
+
+        print(f"\n  [Reference tune] trying num_buckets={nb}...")
+        bucket_edges, _, bucket_fits = _fit_reference_bucket_gmms(
+            reference_scores,
+            reference_mia_scores,
+            num_buckets=nb,
+            verbose=False,
+        )
+        ref_probs, ref_bucket_ids = _apply_reference_bucket_gmms(
+            reference_scores,
+            reference_mia_scores,
+            bucket_edges,
+            bucket_fits,
+        )
+
+        if supervised_selection:
+            if (
+                binary_selection_labels is not None
+                and selection_influence_scores is not None
+                and selection_mia_scores is not None
+            ):
+                selection_probs, _ = _apply_reference_bucket_gmms(
+                    selection_influence_scores,
+                    selection_mia_scores,
+                    bucket_edges,
+                    bucket_fits,
+                )
+                metrics = _compute_metrics_from_scores(binary_selection_labels, selection_probs)
+            else:
+                metrics = _compute_metrics_from_scores(binary_reference_labels, ref_probs)
+        else:
+            metrics = _compute_unsupervised_fit_quality(ref_bucket_ids, bucket_fits)
+        candidate = {
+            "num_buckets": nb,
+            "bucket_edges": bucket_edges,
+            "bucket_fits": bucket_fits,
+            "metrics": metrics,
+        }
+        cache[nb] = candidate
+        tried.append((nb, metrics))
+        eval_count += 1
+        if supervised_selection:
+            print(
+                "    metrics: "
+                f"TPR@0%FPR={metrics['tpr_0']*100:.2f}%  "
+                f"TPR@0.1%FPR={metrics['tpr_01']*100:.2f}%  "
+                f"TPR@1%FPR={metrics['tpr_1']*100:.2f}%  "
+                f"Balanced Acc={metrics['bal_acc']*100:.2f}%"
+            )
+            score_value = metrics[metric_key]
+        else:
+            print(
+                "    fit quality: "
+                f"reliable_fraction={metrics['reliable_fraction']*100:.2f}%  "
+                f"mean_reliable_loglik={metrics['mean_reliable_loglik']:.4f}  "
+                f"objective={metrics['fit_quality']:.6f}"
+            )
+            score_value = metrics["fit_quality"]
+
+        if best is None:
+            best = candidate
+        else:
+            best_score = best["metrics"][metric_key] if supervised_selection else best["metrics"]["fit_quality"]
+            if score_value > best_score:
+                best = candidate
+
+        if best is candidate:
+            pass
+        return candidate
+
+    for nb in seed_candidates:
+        _evaluate(nb)
+        if eval_count >= int(max_evals):
+            break
+
+    if best is not None and eval_count < int(max_evals):
+        search_span = max(max_buckets - min_buckets, 1)
+        step = max(1, search_span // 4)
+        while step >= 1 and eval_count < int(max_evals):
+            improved = True
+            while improved and eval_count < int(max_evals):
+                improved = False
+                current_best_nb = int(best["num_buckets"])
+                for nb in (current_best_nb - step, current_best_nb + step):
+                    prev_best_nb = int(best["num_buckets"])
+                    cand = _evaluate(nb)
+                    if cand is None:
+                        continue
+                    if int(best["num_buckets"]) != prev_best_nb:
+                        improved = True
+            step //= 2
+
+    if best is None:
+        raise RuntimeError("No valid bucket candidates for GMM tuning.")
+
+    print("\n  [Reference tune] summary:")
+    for nb, metrics in tried:
+        if supervised_selection:
+            print(
+                f"    buckets={nb:2d}: "
+                f"TPR@0%FPR={metrics['tpr_0']*100:.2f}%  "
+                f"TPR@0.1%FPR={metrics['tpr_01']*100:.2f}%  "
+                f"TPR@1%FPR={metrics['tpr_1']*100:.2f}%  "
+                f"Balanced Acc={metrics['bal_acc']*100:.2f}%"
+            )
+        else:
+            print(
+                f"    buckets={nb:2d}: "
+                f"reliable_fraction={metrics['reliable_fraction']*100:.2f}%  "
+                f"mean_reliable_loglik={metrics['mean_reliable_loglik']:.4f}  "
+                f"objective={metrics['fit_quality']:.6f}"
+            )
+
+    selected_by = selection_metric if supervised_selection else "fit_quality"
+    print(
+        f"  [Reference tune] selected num_buckets={best['num_buckets']} "
+        f"by {selected_by}"
+    )
+
+    return best
+
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -812,6 +1065,15 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
         cfg = yaml.safe_load(f)
     n_shadow_models = cfg["n_shadow_models"]
     reference_fraction = float(cfg.get("gmm_reference_fraction", 0.25))
+    bucket_candidates = cfg.get("gmm_bucket_candidates", [5, 10, 15, 20, 25])
+    bucket_candidates = sorted(set(int(x) for x in bucket_candidates + [num_buckets]))
+    selection_metrics = cfg.get("gmm_selection_metrics", ["tpr@0%fpr", "tpr@0.1%fpr"])
+    selection_metrics = [str(m).strip().lower() for m in selection_metrics]
+    # Keep order, drop duplicates.
+    selection_metrics = list(dict.fromkeys(selection_metrics))
+    search_max_evals = int(cfg.get("gmm_bucket_search_max_evals", 16))
+    min_buckets_cfg = int(cfg.get("gmm_bucket_min", 2))
+    max_buckets_cfg = int(cfg.get("gmm_bucket_max", 100))
 
     out_dir = os.path.join(exp_dir, "analysis")
     os.makedirs(out_dir, exist_ok=True)
@@ -880,9 +1142,8 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
     # 6. Reference-calibrated bucket fits
     # ------------------------------------------------------------------
     print("\nComputing reference-calibrated bucket fits...")
-    reference_target_scores = _compute_target_scores_for_dataset(
-        exp_dir, cfg, reference_subset
-    )
+    reference_target_scores = _compute_target_scores_for_dataset(exp_dir, cfg, reference_subset)
+    reference_ground_truth = None
     reference_lira_stats, reference_c_lira_list, reference_c_loss_list = _compute_shadow_reference_scores(
         exp_dir, cfg, reference_subset, n_shadow_models
     )
@@ -920,59 +1181,88 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
         analyze_score(name, scores, mia_scores, ground_truth, out_dir, num_buckets, bucket_edges=ref_bucket_edges)
 
     primary_bucket_name = "C_loss" if (scores_C_loss is not None and reference_scores_C_loss is not None) else "C_lira"
-    primary_reference_scores = reference_scores_dict[primary_bucket_name]
-    primary_bucket_edges = np.quantile(primary_reference_scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
+    gmm_bucket_name = primary_bucket_name
+    gmm_bucket_scores = scores_dict[gmm_bucket_name]
+    reference_gmm_bucket_scores = reference_scores_dict[gmm_bucket_name]
 
+    if gmm_bucket_name != "C_loss":
+        print("\nC_loss not available for all shadows; using C_lira for GMM buckets.")
+
+    dual_results = {}
+    first_result = None
+    for selection_metric in selection_metrics:
+        print(
+            "\nTuning bucket count on reference-fitted GMMs "
+            f"for {gmm_bucket_name} by QUERY aggregated metric={selection_metric}..."
+        )
+        best_bucketing = _select_best_reference_bucketing(
+            reference_gmm_bucket_scores,
+            reference_mia_scores,
+            reference_ground_truth=reference_ground_truth,
+            bucket_candidates=bucket_candidates,
+            selection_metric=selection_metric,
+            min_buckets=min_buckets_cfg,
+            max_buckets=max_buckets_cfg,
+            max_evals=search_max_evals,
+            selection_influence_scores=gmm_bucket_scores,
+            selection_mia_scores=mia_scores,
+            selection_ground_truth=ground_truth,
+        )
+
+        active_num_buckets = int(best_bucketing["num_buckets"])
+        reference_bucket_edges = best_bucketing["bucket_edges"]
+        bucket_fits = best_bucketing["bucket_fits"]
+
+        gmm_probs, query_bucket_ids = _apply_reference_bucket_gmms(
+            gmm_bucket_scores,
+            mia_scores,
+            reference_bucket_edges,
+            bucket_fits,
+        )
+
+        metrics_gmm = _compute_metrics_from_scores(ground_truth.astype(int), gmm_probs)
+        tpr_0pct_gmm = metrics_gmm["tpr_0"]
+        tpr_01pct_gmm = metrics_gmm["tpr_01"]
+        tpr_1pct_gmm = metrics_gmm["tpr_1"]
+        bal_acc_gmm = metrics_gmm["bal_acc"]
+
+        print(f"  GMM-aggregated MIA ({selection_metric}): "
+              f"TPR@0%FPR={tpr_0pct_gmm*100:.2f}%, "
+              f"TPR@0.1%FPR={tpr_01pct_gmm*100:.2f}%, "
+              f"TPR@1%FPR={tpr_1pct_gmm*100:.2f}%, "
+              f"Balanced Acc={bal_acc_gmm*100:.2f}%")
+
+        metric_tag = selection_metric.replace("@", "at").replace("%", "pct").replace(".", "p").replace("/", "_")
+        metric_out_dir = os.path.join(out_dir, f"gmm_{metric_tag}")
+        _plot_gmm_bucket_components(
+            gmm_bucket_scores,
+            mia_scores,
+            ground_truth,
+            reference_bucket_edges,
+            bucket_fits,
+            metric_out_dir,
+            active_num_buckets,
+        )
+
+        dual_results[selection_metric] = {
+            "gmm_probs": gmm_probs,
+            "query_bucket_ids": query_bucket_ids,
+            "bucket_edges": reference_bucket_edges,
+            "num_buckets": active_num_buckets,
+            "metrics": metrics_gmm,
+        }
+        if first_result is None:
+            first_result = (selection_metric, dual_results[selection_metric])
+
+    # Keep one representative bucket-comparison plot using first optimization.
+    first_metric, first_payload = first_result
     _plot_bucket_tpr_comparison(
         scores_dict,
         mia_scores,
         ground_truth,
         out_dir,
-        num_buckets,
-        bucket_edges=primary_bucket_edges,
-    )
-
-    # ------------------------------------------------------------------
-    # 8. Bucket-wise GMM aggregation → global MIA
-    # ------------------------------------------------------------------
-    use_c_loss = scores_C_loss is not None and reference_scores_C_loss is not None
-    gmm_bucket_scores = scores_C_loss if use_c_loss else scores_C_lira
-    gmm_bucket_name = "C_loss" if use_c_loss else "C_lira"
-    if not use_c_loss:
-        print("\nC_loss not available for all shadows; falling back to C_lira for GMM buckets.")
-    print(f"\nRunning bucket-wise GMM aggregation on reference calibration ({gmm_bucket_name} buckets)...")
-
-    reference_gmm_bucket_scores = reference_scores_dict[gmm_bucket_name]
-    reference_bucket_edges, _, bucket_fits = _fit_reference_bucket_gmms(
-        reference_gmm_bucket_scores,
-        reference_mia_scores,
-        num_buckets,
-    )
-    gmm_probs, query_bucket_ids = _apply_reference_bucket_gmms(
-        gmm_bucket_scores,
-        mia_scores,
-        reference_bucket_edges,
-        bucket_fits,
-    )
-
-    fpr_gmm, tpr_gmm, _ = roc_curve(ground_truth.astype(int), gmm_probs)
-    tpr_0pct_gmm  = _tpr_at_fpr(fpr_gmm, tpr_gmm, max_fpr=0.0)
-    tpr_01pct_gmm = _tpr_at_fpr(fpr_gmm, tpr_gmm, max_fpr=0.001)
-    tpr_1pct_gmm  = _tpr_at_fpr(fpr_gmm, tpr_gmm, max_fpr=0.01)
-    bal_acc_gmm   = _balanced_accuracy_from_roc(fpr_gmm, tpr_gmm)
-    print(f"  GMM-aggregated MIA: TPR@0%FPR={tpr_0pct_gmm*100:.2f}%, "
-          f"TPR@0.1%FPR={tpr_01pct_gmm*100:.2f}%, "
-          f"TPR@1%FPR={tpr_1pct_gmm*100:.2f}%, "
-          f"Balanced Acc={bal_acc_gmm*100:.2f}%")
-
-    _plot_gmm_bucket_components(
-        gmm_bucket_scores,
-        mia_scores,
-        ground_truth,
-        reference_bucket_edges,
-        bucket_fits,
-        out_dir,
-        num_buckets,
+        int(first_payload["num_buckets"]),
+        bucket_edges=first_payload["bucket_edges"],
     )
 
     # ------------------------------------------------------------------
@@ -980,21 +1270,30 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
     # ------------------------------------------------------------------
     save_dict = dict(
         mia_scores=mia_scores,
-        gmm_probs=gmm_probs,
+        gmm_probs=first_payload["gmm_probs"],
         ground_truth=ground_truth,
         scores_C_lira=scores_C_lira,
         query_pool_indices=query_pool_indices,
         scores_C_lira_reference=reference_scores_C_lira,
-        gmm_bucket_edges=reference_bucket_edges,
+        gmm_bucket_edges=first_payload["bucket_edges"],
         gmm_reference_fraction=np.array(reference_fraction, dtype=np.float32),
         gmm_bucket_name=np.array(gmm_bucket_name),
-        gmm_query_bucket_ids=query_bucket_ids,
+        gmm_selection_metric=np.array(first_metric),
+        gmm_selected_num_buckets=np.array(first_payload["num_buckets"], dtype=np.int32),
+        gmm_query_bucket_ids=first_payload["query_bucket_ids"],
         reference_subset_size=np.array(len(reference_subset), dtype=np.int32),
     )
     if scores_C_loss is not None:
         save_dict["scores_C_loss"] = scores_C_loss
     if reference_scores_C_loss is not None:
         save_dict["scores_C_loss_reference"] = reference_scores_C_loss
+
+    for metric_name, payload in dual_results.items():
+        metric_tag = metric_name.replace("@", "at").replace("%", "pct").replace(".", "p").replace("/", "_")
+        save_dict[f"gmm_probs_{metric_tag}"] = payload["gmm_probs"]
+        save_dict[f"gmm_bucket_edges_{metric_tag}"] = payload["bucket_edges"]
+        save_dict[f"gmm_selected_num_buckets_{metric_tag}"] = np.array(payload["num_buckets"], dtype=np.int32)
+        save_dict[f"gmm_query_bucket_ids_{metric_tag}"] = payload["query_bucket_ids"]
 
     out_path = os.path.join(out_dir, "influence_vs_mia.npz")
     np.savez_compressed(out_path, **save_dict)
@@ -1007,10 +1306,13 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
           f"TPR@0.1%FPR={tpr_01pct_all*100:.2f}%  "
           f"TPR@1%FPR={tpr_1pct_all*100:.2f}%  "
           f"Balanced Acc={bal_acc_all*100:.2f}%")
-    print(f"  MIA (GMM-bucketed):TPR@0%FPR={tpr_0pct_gmm*100:.2f}%  "
-          f"TPR@0.1%FPR={tpr_01pct_gmm*100:.2f}%  "
-          f"TPR@1%FPR={tpr_1pct_gmm*100:.2f}%  "
-          f"Balanced Acc={bal_acc_gmm*100:.2f}%")
+    for metric_name, payload in dual_results.items():
+        m = payload["metrics"]
+        print(f"  MIA (GMM-bucketed, selected by {metric_name}):"
+              f"TPR@0%FPR={m['tpr_0' ]*100:.2f}%  "
+              f"TPR@0.1%FPR={m['tpr_01' ]*100:.2f}%  "
+              f"TPR@1%FPR={m['tpr_1' ]*100:.2f}%  "
+              f"Balanced Acc={m['bal_acc' ]*100:.2f}%")
     print(f"{'='*60}\n")
 
 

@@ -34,4 +34,4 @@ srun --unbuffered python -u -m experiments.run_experiment \
     --output_dir ${OUTPUT_DIR} \
     --cuda       ${CUDA} \
     --exp_name   ${EXP_NAME} \
-    --num_buckets 35
+    --num_buckets 25
