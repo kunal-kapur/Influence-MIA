@@ -62,6 +62,7 @@ def _load_config(dataset: str) -> types.SimpleNamespace:
     cfg.setdefault("margin_weight", 1.0)
     cfg.setdefault("T2", 20)
     cfg.setdefault("k_pivot", 100)
+    cfg.setdefault("gmm_reference_fraction", 0.25)
     return types.SimpleNamespace(**cfg)
 
 

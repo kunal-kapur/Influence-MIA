@@ -9,8 +9,9 @@ The MIA attack score for point i (expected discrepancy) is:
     mia_score[i] = target_score[i] - mean_k(lira_stats[k][i])
 
 This directly measures how much more confident the target model is relative
-to the shadow models' baseline expectation, without requiring IN/OUT Gaussian
-fitting (which is invalid when shadow pools are disjoint from the query set).
+to the shadow models' baseline expectation.  The bucket boundaries and GMM
+parameters are calibrated on a reference subset first, and the query points
+are assigned to those fixed buckets afterwards.
 
 We bucket points by each influence score and compute:
   - Pearson correlation with mia_score
@@ -42,6 +43,8 @@ from sklearn.metrics import roc_curve
 from torch.utils.data import ConcatDataset, DataLoader, Subset
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from data.loader import offline_data_split
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +199,137 @@ def _load_shadow_data(exp_dir: str, n_shadow_models: int, n_query: int):
     return lira_stats, C_lira, C_loss
 
 
+def _build_no_aug_split(cfg: dict, data_type: str):
+    mean = cfg["data_mean"]
+    std = cfg["data_std"]
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+    ])
+    train_ds = torchvision.datasets.CIFAR10(
+        root=cfg["data_dir"], train=True, download=False, transform=transform
+    )
+    test_ds = torchvision.datasets.CIFAR10(
+        root=cfg["data_dir"], train=False, download=False, transform=transform
+    )
+    full_dataset = ConcatDataset([train_ds, test_ds])
+    return offline_data_split(full_dataset, cfg["seed"], data_type)
+
+
+def _select_reference_subset(reference_split, reference_fraction: float, seed: int):
+    if not 0.0 < float(reference_fraction) <= 1.0:
+        raise ValueError(
+            f"gmm_reference_fraction must be in (0, 1], got {reference_fraction}"
+        )
+
+    total = len(reference_split)
+    subset_size = max(1, min(total, int(round(total * float(reference_fraction)))))
+    if subset_size == total:
+        subset_indices = np.arange(total, dtype=np.int64)
+    else:
+        rng = np.random.RandomState(seed)
+        subset_indices = np.sort(
+            rng.choice(total, size=subset_size, replace=False)
+        ).astype(np.int64)
+    return Subset(reference_split, subset_indices.tolist()), subset_indices
+
+
+def _load_model_from_path(model_path: str, device: torch.device):
+    from models.resnet import ResNet18_Influence
+
+    model = ResNet18_Influence().to(device)
+    state_dict = torch.load(model_path, map_location=device, weights_only=False)
+    if "model_state_dict" in state_dict:
+        model.load_state_dict(state_dict["model_state_dict"])
+    else:
+        model.load_state_dict(state_dict)
+    model.eval()
+    return model
+
+
+def _compute_scaled_logit_scores(model, loader, device):
+    scores = []
+    with torch.no_grad():
+        for inputs, targets in loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            logits = model(inputs)
+            probs = torch.softmax(logits, dim=1)
+            p_true = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+            p_true = torch.clamp(p_true, min=1e-7, max=1.0 - 1e-7)
+            scores.append(torch.log(p_true / (1.0 - p_true)).cpu().numpy())
+    return np.concatenate(scores)
+
+
+def _compute_target_scores_for_dataset(exp_dir: str, cfg: dict, dataset) -> np.ndarray:
+    target_path = os.path.join(exp_dir, "target_model.pt")
+    if not os.path.exists(target_path):
+        raise FileNotFoundError(
+            f"Target model not found at {target_path}. Run train_target.py first."
+        )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = _load_model_from_path(target_path, device)
+    loader = DataLoader(
+        dataset,
+        batch_size=256,
+        shuffle=False,
+        num_workers=int(cfg.get("num_workers", 2)),
+    )
+    result = _compute_scaled_logit_scores(model, loader, device)
+    del model
+    return result
+
+
+def _compute_shadow_reference_scores(exp_dir: str, cfg: dict, reference_dataset, n_shadow_models: int):
+    from training.compute_influence import _compute_influence_matrices, _get_lira_statistics
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    shadow_pool_no_aug = _build_no_aug_split(cfg, "shadow")
+    train_dataset_size = int(cfg["pkeep"] * len(shadow_pool_no_aug))
+    reference_loader = DataLoader(
+        reference_dataset,
+        batch_size=256,
+        shuffle=False,
+        num_workers=int(cfg.get("num_workers", 2)),
+    )
+
+    lira_stats_list, c_lira_list, c_loss_list = [], [], []
+    for k in range(n_shadow_models):
+        shadow_dir = os.path.join(exp_dir, "shadows", str(k))
+        model_path = os.path.join(shadow_dir, "shadow_model_out.pt")
+        hinv_path = os.path.join(shadow_dir, "H_inv.npy")
+
+        if not os.path.exists(model_path):
+            print(f"  [reference shadow {k}] missing {model_path} — skipping.")
+            continue
+        if not os.path.exists(hinv_path):
+            raise FileNotFoundError(
+                f"[reference shadow {k}] missing {hinv_path}. Run compute_influence first."
+            )
+
+        model = _load_model_from_path(model_path, device)
+        H_inv = torch.tensor(np.load(hinv_path), dtype=torch.float32, device=device)
+
+        C_lira, C_loss = _compute_influence_matrices(
+            model,
+            reference_loader,
+            H_inv,
+            train_dataset_size=train_dataset_size,
+            device=device,
+        )
+        lira_stats = _get_lira_statistics(model, reference_loader, device)
+
+        lira_stats_list.append(lira_stats)
+        c_lira_list.append(C_lira)
+        c_loss_list.append(C_loss)
+
+        del model, H_inv, C_lira, C_loss, lira_stats
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return lira_stats_list, c_lira_list, c_loss_list
+
+
 # ---------------------------------------------------------------------------
 # Query-set metadata
 # ---------------------------------------------------------------------------
@@ -251,23 +385,7 @@ def _compute_target_lira_scores(exp_dir: str, cfg: dict,
     corresponds to query point i — the same ordering used by lira_stats,
     C_lira, in_mask, and ground_truth.
     """
-    from models.resnet import ResNet18_Influence
     from data.loader import offline_data_split
-
-    target_path = os.path.join(exp_dir, "target_model.pt")
-    if not os.path.exists(target_path):
-        raise FileNotFoundError(
-            f"Target model not found at {target_path}. Run train_target.py first."
-        )
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model  = ResNet18_Influence().to(device)
-    state_dict = torch.load(target_path, map_location=device, weights_only=False)
-    if "model_state_dict" in state_dict:
-        model.load_state_dict(state_dict["model_state_dict"])
-    else:
-        model.load_state_dict(state_dict)
-    model.eval()
 
     mean = cfg["data_mean"]
     std  = cfg["data_std"]
@@ -289,19 +407,7 @@ def _compute_target_lira_scores(exp_dir: str, cfg: dict,
 
     # Subset to the query points in query_indices order (no shuffling)
     query_ds = Subset(target_pool, query_pool_indices.tolist())
-    loader   = DataLoader(query_ds, batch_size=256, shuffle=False, num_workers=2)
-
-    scores = []
-    with torch.no_grad():
-        for inputs, targets in loader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            logits  = model(inputs)
-            probs   = torch.softmax(logits, dim=1)
-            p_true  = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
-            p_true  = torch.clamp(p_true, min=1e-7, max=1.0 - 1e-7)
-            scores.append(torch.log(p_true / (1.0 - p_true)).cpu().numpy())
-
-    result = np.concatenate(scores)
+    result = _compute_target_scores_for_dataset(exp_dir, cfg, query_ds)
     n_query = len(query_pool_indices)
     assert result.shape == (n_query,), (
         f"Target score array shape {result.shape} != (n_query={n_query},). "
@@ -333,33 +439,26 @@ def _aggregate_influence(C_list):
     return np.stack([C_list[k] for k in range(K)], axis=0).mean(axis=0)
 
 
-def _gmm_aggregate_mia_scores(
-    influence_scores: np.ndarray,
-    mia_scores: np.ndarray,
-    num_buckets: int = 10,
-) -> np.ndarray:
-    """Bucket-wise constrained-mixture aggregation of MIA scores.
+def _bucketize_scores(scores: np.ndarray, bucket_edges: np.ndarray) -> np.ndarray:
+    return np.digitize(scores, bucket_edges)
 
-    Uses fit_fixed_zero_rightshift_mixture per bucket.  If the fit is not
-    reliable, falls back to 0.5 (uncertain).  Buckets too small (< 10) fall
-    back to rank-normalised raw scores.
-    """
-    N = len(mia_scores)
-    gmm_probs = np.full(N, np.nan)
 
-    quantiles  = np.quantile(influence_scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
-    bucket_ids = np.digitize(influence_scores, quantiles)
+def _fit_reference_bucket_gmms(influence_scores: np.ndarray, mia_scores: np.ndarray,
+                               num_buckets: int = 10, min_points: int = 10):
+    bucket_edges = np.quantile(influence_scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
+    bucket_ids = _bucketize_scores(influence_scores, bucket_edges)
+    fits = []
 
     for b in range(num_buckets):
         idx = np.where(bucket_ids == b)[0]
-        if len(idx) < 10:
-            ranks = np.argsort(np.argsort(mia_scores[idx])).astype(float)
-            gmm_probs[idx] = ranks / max(len(idx) - 1, 1)
+        if len(idx) < min_points:
+            print(f"  [Reference bucket {b}] n={len(idx)}: too few points for mixture; using fallback p_in=0.5")
+            fits.append(None)
             continue
 
         fit = fit_fixed_zero_rightshift_mixture(mia_scores[idx])
         print(
-            f"  [Bucket {b}] n={len(idx)}: "
+            f"  [Reference bucket {b}] n={len(idx)}: "
             f"mu_in={fit['mu_in']:.3f}  "
             f"sd_out={np.sqrt(fit['var_out']):.3f}  "
             f"sd_in={np.sqrt(fit['var_in']):.3f}  "
@@ -368,12 +467,34 @@ def _gmm_aggregate_mia_scores(
             f"converged={fit['converged']}"
         )
         if not fit["reliable"]:
-            print(f"    -> unreliable: {fit['reason']} — defaulting to p_in=0.5")
+            print(f"    -> unreliable: {fit['reason']} — query points in this bucket will default to p_in=0.5")
+        fits.append(fit)
+
+    return bucket_edges, bucket_ids, fits
+
+
+def _posterior_in_from_fit(fit, mia_scores: np.ndarray) -> np.ndarray:
+    mia_scores = np.asarray(mia_scores, dtype=float)
+    log_p_out = np.log(fit["pi_out"] + 1e-300) + norm.logpdf(mia_scores, 0.0, np.sqrt(fit["var_out"]))
+    log_p_in = np.log(fit["pi_in"] + 1e-300) + norm.logpdf(mia_scores, fit["mu_in"], np.sqrt(fit["var_in"]))
+    return np.exp(log_p_in - np.logaddexp(log_p_out, log_p_in))
+
+
+def _apply_reference_bucket_gmms(influence_scores: np.ndarray, mia_scores: np.ndarray,
+                                 bucket_edges: np.ndarray, bucket_fits):
+    bucket_ids = _bucketize_scores(influence_scores, bucket_edges)
+    gmm_probs = np.full(len(mia_scores), 0.5, dtype=float)
+
+    for b, fit in enumerate(bucket_fits):
+        idx = np.where(bucket_ids == b)[0]
+        if len(idx) == 0:
+            continue
+        if fit is None or not fit["reliable"]:
             gmm_probs[idx] = 0.5
         else:
-            gmm_probs[idx] = fit["posterior_in"]
+            gmm_probs[idx] = _posterior_in_from_fit(fit, mia_scores[idx])
 
-    return gmm_probs
+    return gmm_probs, bucket_ids
 
 
 # ---------------------------------------------------------------------------
@@ -411,13 +532,15 @@ def _plot_bucket_mia_hist(mia_scores, ground_truth, bucket_indices, bucket_id,
     plt.close(fig)
 
 
-def _plot_bucket_tpr_comparison(scores_dict, mia_scores, ground_truth, out_dir, num_buckets):
+def _plot_bucket_tpr_comparison(scores_dict, mia_scores, ground_truth, out_dir, num_buckets,
+                                bucket_edges=None):
     score_names = list(scores_dict.keys())
     bucket_tprs = {name: [] for name in score_names}
 
     ref_scores = next(iter(scores_dict.values()))
-    quantiles  = np.quantile(ref_scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
-    bucket_ids = np.digitize(ref_scores, quantiles)
+    if bucket_edges is None:
+        bucket_edges = np.quantile(ref_scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
+    bucket_ids = np.digitize(ref_scores, bucket_edges)
 
     for b in range(num_buckets):
         idx = np.where(bucket_ids == b)[0]
@@ -463,20 +586,13 @@ def _plot_score_vs_mia(score_name, scores, mia_scores, ground_truth, out_dir):
     plt.close(fig)
 
 
-def _plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, out_dir,
-                                num_buckets=10, min_points=10):
-    """Plot one fitted constrained mixture per influence bucket.
-
-    Each bucket plot shows histograms for members / non-members, the total
-    mixture density, the OUT component (mean fixed at 0), the IN component
-    (mean > 0), vertical lines at 0 and mu_in, and (optionally) the
-    posterior-equality threshold.  Unreliable fits are flagged in the title.
-    """
+def _plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, bucket_edges,
+                                bucket_fits, out_dir, num_buckets=10):
+    """Plot query points against the reference-fitted constrained mixtures."""
     bucket_plot_dir = os.path.join(out_dir, "gmm_bucket_components")
     os.makedirs(bucket_plot_dir, exist_ok=True)
     csv_rows = []
-    quantiles = np.quantile(influence_scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
-    bucket_ids = np.digitize(influence_scores, quantiles)
+    bucket_ids = np.digitize(influence_scores, bucket_edges)
 
     for b in range(num_buckets):
         idx = np.where(bucket_ids == b)[0]
@@ -502,8 +618,8 @@ def _plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, out_
 
         fig, ax = plt.subplots(figsize=(7.2, 4.8))
 
-        if len(idx) >= min_points:
-            fit = fit_fixed_zero_rightshift_mixture(bucket_scores)
+        fit = bucket_fits[b] if b < len(bucket_fits) else None
+        if fit is not None:
             thr_str = f"{fit['threshold']:.3f}" if fit["threshold"] is not None else "none"
             print(
                 f"  [Bucket {b}] n={len(idx)}: "
@@ -521,8 +637,8 @@ def _plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, out_
             pdf_in    = fit["pi_in"]  * norm.pdf(x_grid, fit["mu_in"], np.sqrt(fit["var_in"]))
             total_pdf = pdf_out + pdf_in
 
-            p_in  = fit["posterior_in"]
-            p_out = fit["posterior_out"]
+            p_in  = _posterior_in_from_fit(fit, bucket_scores)
+            p_out = 1.0 - p_in
         else:
             fit       = None
             total_pdf = None
@@ -530,10 +646,6 @@ def _plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, out_
             pdf_in    = None
             p_in  = np.full(len(idx), np.nan, dtype=float)
             p_out = np.full(len(idx), np.nan, dtype=float)
-            if len(idx) > 0:
-                ranks = np.argsort(np.argsort(bucket_scores)).astype(float)
-                p_in  = ranks / max(len(idx) - 1, 1)
-                p_out = 1.0 - p_in
 
         predicted_is_in = p_in >= 0.5
 
@@ -631,12 +743,14 @@ def _plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, out_
 # Core analysis
 # ---------------------------------------------------------------------------
 
-def analyze_score(score_name, scores, mia_scores, ground_truth, out_dir, num_buckets=10):
+def analyze_score(score_name, scores, mia_scores, ground_truth, out_dir, num_buckets=10,
+                  bucket_edges=None):
     corr = np.corrcoef(scores, mia_scores)[0, 1]
     print(f"\n  [{score_name}] Pearson corr(score, MIA score): {corr:.3f}")
 
-    quantiles  = np.quantile(scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
-    bucket_ids = np.digitize(scores, quantiles)
+    if bucket_edges is None:
+        bucket_edges = np.quantile(scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
+    bucket_ids = np.digitize(scores, bucket_edges)
 
     print(f"  [{score_name}] Bucketed metrics (within-bucket and scan-from-bucket vs full dataset):")
     for b in range(num_buckets):
@@ -697,6 +811,7 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
     with open(cfg_path) as f:
         cfg = yaml.safe_load(f)
     n_shadow_models = cfg["n_shadow_models"]
+    reference_fraction = float(cfg.get("gmm_reference_fraction", 0.25))
 
     out_dir = os.path.join(exp_dir, "analysis")
     os.makedirs(out_dir, exist_ok=True)
@@ -713,7 +828,20 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
     print(f"  n_query={n_query}  members={members}  non-members={nonmembers}")
 
     # ------------------------------------------------------------------
-    # 2. Shadow artifacts — all must have shape (n_query,)
+    # 2. Reference calibration subset for bucket / GMM fitting
+    # ------------------------------------------------------------------
+    print(f"\nLoading reference split for calibration (fraction={reference_fraction:.2f})...")
+    reference_pool_no_aug = _build_no_aug_split(cfg, "reference")
+    reference_subset, reference_subset_indices = _select_reference_subset(
+        reference_pool_no_aug, reference_fraction, cfg["seed"]
+    )
+    print(
+        f"  reference split size={len(reference_pool_no_aug)}  "
+        f"calibration subset={len(reference_subset)}"
+    )
+
+    # ------------------------------------------------------------------
+    # 3. Shadow artifacts — all query caches must have shape (n_query,)
     # ------------------------------------------------------------------
     print(f"\nLoading {n_shadow_models} shadow models from {exp_dir}/shadows/...")
     lira_stats, C_lira_list, C_loss_list = _load_shadow_data(
@@ -727,14 +855,14 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
         return
 
     # ------------------------------------------------------------------
-    # 3. Target model scores on D_query
+    # 4. Target model scores on D_query
     # ------------------------------------------------------------------
     print("\nEvaluating target model on query set...")
     target_scores = _compute_target_lira_scores(exp_dir, cfg, query_pool_indices)
     print(f"  target_scores: mean={target_scores.mean():.3f}, std={target_scores.std():.3f}")
 
     # ------------------------------------------------------------------
-    # 4. Expected discrepancy MIA scores
+    # 5. Expected discrepancy MIA scores
     # ------------------------------------------------------------------
     print("\nComputing MIA scores (expected discrepancy)...")
     mia_scores = _compute_mia_scores(lira_stats, target_scores)
@@ -749,31 +877,83 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
           f"TPR@1%FPR={tpr_1pct_all*100:.2f}%, Balanced Acc={bal_acc_all*100:.2f}%")
 
     # ------------------------------------------------------------------
-    # 5. Influence scores
+    # 6. Reference-calibrated bucket fits
+    # ------------------------------------------------------------------
+    print("\nComputing reference-calibrated bucket fits...")
+    reference_target_scores = _compute_target_scores_for_dataset(
+        exp_dir, cfg, reference_subset
+    )
+    reference_lira_stats, reference_c_lira_list, reference_c_loss_list = _compute_shadow_reference_scores(
+        exp_dir, cfg, reference_subset, n_shadow_models
+    )
+    if len(reference_lira_stats) < 2:
+        print("  Need at least 2 complete reference shadows — skipping GMM calibration.")
+        return
+
+    reference_mia_scores = _compute_mia_scores(reference_lira_stats, reference_target_scores)
+
+    # ------------------------------------------------------------------
+    # 7. Influence scores
     # ------------------------------------------------------------------
     print("\nAggregating influence scores across shadows...")
     scores_C_lira = _aggregate_influence(C_lira_list)
     has_closs     = all(c is not None for c in C_loss_list)
     scores_C_loss = _aggregate_influence(C_loss_list) if has_closs else None
 
+    reference_scores_C_lira = _aggregate_influence(reference_c_lira_list)
+    has_reference_closs = all(c is not None for c in reference_c_loss_list)
+    reference_scores_C_loss = _aggregate_influence(reference_c_loss_list) if has_reference_closs else None
+
     scores_dict = {"C_lira": scores_C_lira}
     if scores_C_loss is not None:
         scores_dict["C_loss"] = scores_C_loss
 
+    reference_scores_dict = {"C_lira": reference_scores_C_lira}
+    if reference_scores_C_loss is not None:
+        reference_scores_dict["C_loss"] = reference_scores_C_loss
+
     for name, scores in scores_dict.items():
-        analyze_score(name, scores, mia_scores, ground_truth, out_dir, num_buckets)
+        ref_scores = reference_scores_dict.get(name)
+        ref_bucket_edges = None
+        if ref_scores is not None:
+            ref_bucket_edges = np.quantile(ref_scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
+        analyze_score(name, scores, mia_scores, ground_truth, out_dir, num_buckets, bucket_edges=ref_bucket_edges)
 
-    _plot_bucket_tpr_comparison(scores_dict, mia_scores, ground_truth, out_dir, num_buckets)
+    primary_bucket_name = "C_loss" if (scores_C_loss is not None and reference_scores_C_loss is not None) else "C_lira"
+    primary_reference_scores = reference_scores_dict[primary_bucket_name]
+    primary_bucket_edges = np.quantile(primary_reference_scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
+
+    _plot_bucket_tpr_comparison(
+        scores_dict,
+        mia_scores,
+        ground_truth,
+        out_dir,
+        num_buckets,
+        bucket_edges=primary_bucket_edges,
+    )
 
     # ------------------------------------------------------------------
-    # 6. Bucket-wise GMM aggregation → global MIA
+    # 8. Bucket-wise GMM aggregation → global MIA
     # ------------------------------------------------------------------
-    gmm_bucket_scores = scores_C_loss if scores_C_loss is not None else scores_C_lira
-    gmm_bucket_name = "C_loss" if scores_C_loss is not None else "C_lira"
-    if scores_C_loss is None:
+    use_c_loss = scores_C_loss is not None and reference_scores_C_loss is not None
+    gmm_bucket_scores = scores_C_loss if use_c_loss else scores_C_lira
+    gmm_bucket_name = "C_loss" if use_c_loss else "C_lira"
+    if not use_c_loss:
         print("\nC_loss not available for all shadows; falling back to C_lira for GMM buckets.")
-    print(f"\nRunning bucket-wise GMM aggregation ({gmm_bucket_name} buckets)...")
-    gmm_probs = _gmm_aggregate_mia_scores(gmm_bucket_scores, mia_scores, num_buckets)
+    print(f"\nRunning bucket-wise GMM aggregation on reference calibration ({gmm_bucket_name} buckets)...")
+
+    reference_gmm_bucket_scores = reference_scores_dict[gmm_bucket_name]
+    reference_bucket_edges, _, bucket_fits = _fit_reference_bucket_gmms(
+        reference_gmm_bucket_scores,
+        reference_mia_scores,
+        num_buckets,
+    )
+    gmm_probs, query_bucket_ids = _apply_reference_bucket_gmms(
+        gmm_bucket_scores,
+        mia_scores,
+        reference_bucket_edges,
+        bucket_fits,
+    )
 
     fpr_gmm, tpr_gmm, _ = roc_curve(ground_truth.astype(int), gmm_probs)
     tpr_0pct_gmm  = _tpr_at_fpr(fpr_gmm, tpr_gmm, max_fpr=0.0)
@@ -785,10 +965,18 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
           f"TPR@1%FPR={tpr_1pct_gmm*100:.2f}%, "
           f"Balanced Acc={bal_acc_gmm*100:.2f}%")
 
-    _plot_gmm_bucket_components(gmm_bucket_scores, mia_scores, ground_truth, out_dir, num_buckets)
+    _plot_gmm_bucket_components(
+        gmm_bucket_scores,
+        mia_scores,
+        ground_truth,
+        reference_bucket_edges,
+        bucket_fits,
+        out_dir,
+        num_buckets,
+    )
 
     # ------------------------------------------------------------------
-    # 7. Save analysis outputs
+    # 9. Save analysis outputs
     # ------------------------------------------------------------------
     save_dict = dict(
         mia_scores=mia_scores,
@@ -796,9 +984,17 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
         ground_truth=ground_truth,
         scores_C_lira=scores_C_lira,
         query_pool_indices=query_pool_indices,
+        scores_C_lira_reference=reference_scores_C_lira,
+        gmm_bucket_edges=reference_bucket_edges,
+        gmm_reference_fraction=np.array(reference_fraction, dtype=np.float32),
+        gmm_bucket_name=np.array(gmm_bucket_name),
+        gmm_query_bucket_ids=query_bucket_ids,
+        reference_subset_size=np.array(len(reference_subset), dtype=np.int32),
     )
     if scores_C_loss is not None:
         save_dict["scores_C_loss"] = scores_C_loss
+    if reference_scores_C_loss is not None:
+        save_dict["scores_C_loss_reference"] = reference_scores_C_loss
 
     out_path = os.path.join(out_dir, "influence_vs_mia.npz")
     np.savez_compressed(out_path, **save_dict)

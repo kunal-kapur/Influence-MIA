@@ -20,3 +20,4 @@ n_shadow_models: 20
 imitate_acc: 0.6        # quality gate threshold on shadow OUT model val accuracy
 T2: 20                  # Phase 2 (IN model) training epochs
 k_pivot: 100            # pivot instances per class for D_pivot
+gmm_reference_fraction: 0.25  # fraction of the reference split used for GMM calibration
