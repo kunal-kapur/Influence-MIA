@@ -151,7 +151,9 @@ def train_shadow(args, shadow_id, device, pivot_indices=None):
 
     Phase 2 — Imitative IN model:
         Reload warmup checkpoint (NOT f_out)
-        Epochs 1..T2         : CE loss on D_pivot
+        Epochs 1..T2         : CE loss on D_pivot using a Phase 2-specific
+                               optimizer setup (lower LR, optional cosine decay,
+                               and pivot-sized batching)
         Save as shadow_model_in.pt
 
     Args:
@@ -215,8 +217,14 @@ def train_shadow(args, shadow_id, device, pivot_indices=None):
         print(f"[shadow {shadow_id}] Loaded {len(pivot_indices)} pivot indices.")
 
     pivot_ds = Subset(shadow_pool_no_aug, pivot_indices.tolist())
+
+    # Phase 2 uses a much smaller pivot set than Phase 1. Use a smaller default
+    # batch size so each epoch has more optimization steps.
+    phase2_batch_size = int(getattr(args, "phase2_batch_size", min(args.batch_size, 64)))
+    phase2_batch_size = max(1, min(phase2_batch_size, len(pivot_ds)))
+
     pivot_dl = DataLoader(
-        pivot_ds, batch_size=args.batch_size, shuffle=True,
+        pivot_ds, batch_size=phase2_batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=use_pin,
     )
 
@@ -375,10 +383,36 @@ def train_shadow(args, shadow_id, device, pivot_indices=None):
     student.load_state_dict(warmup_state_dict)
     student.to(device)
 
-    optimizer_p2 = build_optimizer(args, student.parameters())
+    phase2_lr = float(getattr(args, "phase2_lr", args.lr * 0.1))
+    if phase2_lr <= 0.0:
+        raise ValueError(f"phase2_lr must be > 0, got {phase2_lr}")
+
+    optimizer_name = args.optimizer.lower()
+    if optimizer_name == "sgd":
+        optimizer_p2 = torch.optim.SGD(
+            student.parameters(),
+            lr=phase2_lr,
+            momentum=getattr(args, "phase2_momentum", args.momentum),
+            weight_decay=getattr(args, "phase2_weight_decay", args.weight_decay),
+        )
+    elif optimizer_name == "adam":
+        optimizer_p2 = torch.optim.Adam(
+            student.parameters(),
+            lr=phase2_lr,
+            weight_decay=getattr(args, "phase2_weight_decay", args.weight_decay),
+        )
+    else:
+        raise ValueError(f"Unsupported optimizer: {args.optimizer}")
+
+    use_phase2_cosine = bool(getattr(args, "phase2_use_cosine", True))
+    scheduler_p2 = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_p2, T_max=max(1, T2))
+        if use_phase2_cosine else None
+    )
 
     print(f"[shadow {shadow_id}] Phase 2: training IN model for {T2} epochs "
-          f"on pivot set ({len(pivot_ds)} instances).")
+          f"on pivot set ({len(pivot_ds)} instances, batch_size={phase2_batch_size}, "
+          f"lr={phase2_lr:.6f}, cosine={use_phase2_cosine}).")
 
     for epoch in range(1, T2 + 1):
         student.train()
@@ -396,6 +430,9 @@ def train_shadow(args, shadow_id, device, pivot_indices=None):
             running_loss += loss.item()
             n_batches    += 1
 
+        if scheduler_p2 is not None:
+            scheduler_p2.step()
+
         epoch_loss_p2 = running_loss / n_batches if n_batches > 0 else float("nan")
         history_p2["train_loss"].append(epoch_loss_p2)
         if n_batches > 0:
@@ -411,7 +448,7 @@ def train_shadow(args, shadow_id, device, pivot_indices=None):
     # ------------------------------------------------------------------
     # 9. Cleanup
     # ------------------------------------------------------------------
-    del student, teacher_model, optimizer, optimizer_p2, scheduler
+    del student, teacher_model, optimizer, optimizer_p2, scheduler, scheduler_p2
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
