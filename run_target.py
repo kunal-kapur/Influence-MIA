@@ -9,6 +9,7 @@ from argparse import Namespace
 sys.path.insert(0, str(Path(__file__).parent))
 
 from training import train_target
+from data.loader import get_dataset
 
 
 def parse_args():
@@ -57,6 +58,7 @@ def main():
 
     args = load_config(cli.dataset)
     args.dataset = cli.dataset
+    get_dataset(args)  # sets args.in_channels, data_mean, data_std, num_classes
 
     # Build experiment directory: <output_dir>/<exp_name>/<dataset>/
     exp_name = make_exp_name(args)

@@ -1,0 +1,20 @@
+seed: 42
+model_type: resnet18
+data_dir: "/scratch/scholar/kapur16/data/"
+num_classes: 10
+data_mean: [0.2860]
+data_std:  [0.3530]
+lr: 0.01
+optimizer: sgd
+momentum: 0.9
+weight_decay: 0.0005
+lr_schedule: cosine
+step_milestones: [60, 80]
+step_gamma: 0.1
+epochs: 80
+batch_size: 256
+pkeep: 0.5
+num_workers: 1
+n_shadow_models: 20
+imitate_acc: 0.6
+shared_pool_size: 10000

@@ -106,16 +106,27 @@ def load_shadow_data(
     return lira_stats, C_lira, C_loss
 
 
+def _get_torchvision_cls(cfg: dict):
+    """Return the torchvision dataset class for the configured dataset."""
+    name = cfg.get("dataset", "cifar10").lower()
+    if name == "mnist":
+        return torchvision.datasets.MNIST
+    elif name == "fmnist":
+        return torchvision.datasets.FashionMNIST
+    return torchvision.datasets.CIFAR10
+
+
 def build_target_pool_global_indices(cfg: dict) -> np.ndarray:
     """Reconstruct shared pool D global indices exactly as in training."""
+    ds_cls = _get_torchvision_cls(cfg)
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(cfg["data_mean"], cfg["data_std"]),
     ])
-    train_ds = torchvision.datasets.CIFAR10(
+    train_ds = ds_cls(
         root=cfg["data_dir"], train=True, download=False, transform=transform
     )
-    test_ds = torchvision.datasets.CIFAR10(
+    test_ds = ds_cls(
         root=cfg["data_dir"], train=False, download=False, transform=transform
     )
     target_pool = split_dataset_for_type(
@@ -199,7 +210,10 @@ def compute_target_lira_scores(
     assert os.path.basename(target_path) == "target_model.pt"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model  = ResNet18_Influence(num_classes=int(cfg["num_classes"])).to(device)
+    model  = ResNet18_Influence(
+        num_classes=int(cfg["num_classes"]),
+        in_channels=int(cfg.get("in_channels", 3)),
+    ).to(device)
     state_dict = torch.load(target_path, map_location=device, weights_only=False)
     if "model_state_dict" in state_dict:
         model.load_state_dict(state_dict["model_state_dict"])
@@ -207,14 +221,15 @@ def compute_target_lira_scores(
         model.load_state_dict(state_dict)
     model.eval()
 
+    ds_cls = _get_torchvision_cls(cfg)
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(cfg["data_mean"], cfg["data_std"]),
     ])
-    train_ds = torchvision.datasets.CIFAR10(
+    train_ds = ds_cls(
         root=cfg["data_dir"], train=True, download=False, transform=transform
     )
-    test_ds = torchvision.datasets.CIFAR10(
+    test_ds = ds_cls(
         root=cfg["data_dir"], train=False, download=False, transform=transform
     )
     full_dataset = ConcatDataset([train_ds, test_ds])

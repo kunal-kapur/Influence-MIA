@@ -33,6 +33,15 @@ from utils.io import load_model, load_array, save_array
 # Data helpers
 # ---------------------------------------------------------------------------
 
+def _get_torchvision_cls(args):
+    name = getattr(args, "dataset", "cifar10").lower()
+    if name == "mnist":
+        return torchvision.datasets.MNIST
+    elif name == "fmnist":
+        return torchvision.datasets.FashionMNIST
+    return torchvision.datasets.CIFAR10
+
+
 def _load_query_indices(exp_dir: str) -> np.ndarray:
     """Global dataset indices of the query set, shape (n_query,)."""
     path = os.path.join(exp_dir, "query_indices.npy")
@@ -47,19 +56,13 @@ def _load_query_indices(exp_dir: str) -> np.ndarray:
 def _build_target_pool_no_aug(args):
     """Load the shared target/shadow pool (D) with normalisation only."""
     get_dataset(args)
-    mean = args.data_mean
-    std  = args.data_std
-
+    ds_cls = _get_torchvision_cls(args)
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize(mean, std),
+        transforms.Normalize(args.data_mean, args.data_std),
     ])
-    train_ds = torchvision.datasets.CIFAR10(
-        root=args.data_dir, train=True, download=True, transform=transform,
-    )
-    test_ds = torchvision.datasets.CIFAR10(
-        root=args.data_dir, train=False, download=True, transform=transform,
-    )
+    train_ds = ds_cls(root=args.data_dir, train=True,  download=True, transform=transform)
+    test_ds  = ds_cls(root=args.data_dir, train=False, download=True, transform=transform)
     return split_dataset_for_type(
         ConcatDataset([train_ds, test_ds]),
         seed=args.seed,
@@ -69,21 +72,15 @@ def _build_target_pool_no_aug(args):
 
 
 def _build_full_eval_dataset_no_aug(args):
-    """Load full CIFAR-10 train+test with normalisation only."""
+    """Load full train+test with normalisation only."""
     get_dataset(args)
-    mean = args.data_mean
-    std = args.data_std
-
+    ds_cls = _get_torchvision_cls(args)
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize(mean, std),
+        transforms.Normalize(args.data_mean, args.data_std),
     ])
-    train_ds = torchvision.datasets.CIFAR10(
-        root=args.data_dir, train=True, download=True, transform=transform,
-    )
-    test_ds = torchvision.datasets.CIFAR10(
-        root=args.data_dir, train=False, download=True, transform=transform,
-    )
+    train_ds = ds_cls(root=args.data_dir, train=True,  download=True, transform=transform)
+    test_ds  = ds_cls(root=args.data_dir, train=False, download=True, transform=transform)
     return ConcatDataset([train_ds, test_ds])
 
 
@@ -94,19 +91,13 @@ def _build_shadow_pool_no_aug(args):
     Hessian computation — we must use the same pool the model trained on.
     """
     get_dataset(args)
-    mean = args.data_mean
-    std  = args.data_std
-
+    ds_cls = _get_torchvision_cls(args)
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize(mean, std),
+        transforms.Normalize(args.data_mean, args.data_std),
     ])
-    train_ds = torchvision.datasets.CIFAR10(
-        root=args.data_dir, train=True, download=True, transform=transform,
-    )
-    test_ds = torchvision.datasets.CIFAR10(
-        root=args.data_dir, train=False, download=True, transform=transform,
-    )
+    train_ds = ds_cls(root=args.data_dir, train=True,  download=True, transform=transform)
+    test_ds  = ds_cls(root=args.data_dir, train=False, download=True, transform=transform)
     return split_dataset_for_type(
         ConcatDataset([train_ds, test_ds]),
         seed=args.seed,
@@ -126,7 +117,7 @@ def _extract_features(model, x):
     out = model.layer2(out)
     out = model.layer3(out)
     out = model.layer4(out)
-    out = F.avg_pool2d(out, 4)
+    out = F.adaptive_avg_pool2d(out, (1, 1))
     phi = out.view(bs, -1)
     ones = torch.ones(bs, 1, device=x.device, dtype=phi.dtype)
     return torch.cat([phi, ones], dim=1)  # (bs, F+1)
@@ -394,7 +385,10 @@ def compute_influence(args, shadow_id, device):
     # 5. Load shadow model
     # ------------------------------------------------------------------
     model_path = os.path.join(out_dir, "shadow_model.pt")
-    model = ResNet18_Influence(num_classes=args.num_classes).to(device)
+    model = ResNet18_Influence(
+        num_classes=args.num_classes,
+        in_channels=getattr(args, "in_channels", 3),
+    ).to(device)
     model = load_model(model, model_path, device)
     model.eval()
     print(f"[shadow {shadow_id}] Model loaded from {model_path}")

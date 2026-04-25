@@ -68,11 +68,11 @@ class Bottleneck(nn.Module):
 
 
 class ResNet(nn.Module):
-    def __init__(self, block, num_blocks, num_classes=10):
+    def __init__(self, block, num_blocks, num_classes=10, in_channels=3):
         super(ResNet, self).__init__()
         self.in_planes = 64
 
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=3,
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=3,
                                stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
         self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
@@ -95,7 +95,7 @@ class ResNet(nn.Module):
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.layer4(out)
-        out = F.avg_pool2d(out, 4)
+        out = F.adaptive_avg_pool2d(out, (1, 1))
         out = out.view(out.size(0), -1)
         out = self.linear(out)
         return out
@@ -121,10 +121,10 @@ class ResNet(nn.Module):
         return torch.cat(t_bases, dim=0)
 
 
-def ResNet18(num_classes=10):
-    return ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes)
+def ResNet18(num_classes=10, in_channels=3):
+    return ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, in_channels=in_channels)
 
 
-def ResNet18_Influence(num_classes=10):
+def ResNet18_Influence(num_classes=10, in_channels=3):
     """ResNet18 configured for influence-function / MIA experiments."""
-    return ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes)
+    return ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, in_channels=in_channels)

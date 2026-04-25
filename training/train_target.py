@@ -120,7 +120,10 @@ def train_target(args, device):
     # ------------------------------------------------------------------
     # 5. Model, optimizer, scheduler
     # ------------------------------------------------------------------
-    model = ResNet18_Influence(num_classes=args.num_classes).to(device)
+    model = ResNet18_Influence(
+        num_classes=args.num_classes,
+        in_channels=getattr(args, "in_channels", 3),
+    ).to(device)
     optimizer = build_optimizer(args, model.parameters())
     scheduler = build_scheduler(args, optimizer)
 

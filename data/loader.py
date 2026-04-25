@@ -6,21 +6,36 @@ import numpy as np
 
 
 def get_dataset(args):
-    """Return CIFAR-10 dataset class and set metadata on args."""
-    args.data_mean = [0.4914, 0.4822, 0.4465]
-    args.data_std = [0.2023, 0.1994, 0.2010]
-    args.num_classes = 10
-    return torchvision.datasets.CIFAR10
+    """Return dataset class and set metadata on args."""
+    dataset_name = getattr(args, "dataset", "cifar10").lower()
+    if dataset_name == "mnist":
+        args.data_mean = [0.1307]
+        args.data_std  = [0.3081]
+        args.num_classes = 10
+        args.in_channels = 1
+        return torchvision.datasets.MNIST
+    elif dataset_name == "fmnist":
+        args.data_mean = [0.2860]
+        args.data_std  = [0.3530]
+        args.num_classes = 10
+        args.in_channels = 1
+        return torchvision.datasets.FashionMNIST
+    else:  # cifar10
+        args.data_mean = [0.4914, 0.4822, 0.4465]
+        args.data_std  = [0.2023, 0.1994, 0.2010]
+        args.num_classes = 10
+        args.in_channels = 3
+        return torchvision.datasets.CIFAR10
 
 
 def offline_data_split(dataset, seed, data_type):
     """
-    Split the full 60k CIFAR-10 dataset deterministically into four disjoint pools:
+    Split the full dataset deterministically into four disjoint pools:
 
-      target     : n // 3        (20 000) — candidate set D for target model
-      shadow     : n // 3        (20 000) — auxiliary pool for shadow model training
-      validation : n // 12       ( 5 000) — small held-out split
-      reference  : remainder     (15 000) — disjoint reference data
+      target     : n // 3        — candidate set D for target model
+      shadow     : n // 3        — auxiliary pool for shadow model training
+      validation : n // 12       — small held-out split
+      reference  : remainder     — disjoint reference data
 
     Sizes are fixed by n and the seed; changing either invalidates saved artifacts.
     """
@@ -81,7 +96,7 @@ def split_dataset_for_type(dataset, seed, data_type, shared_pool_size=None):
 
 def load_dataset(args, data_type="target"):
     """
-    Load CIFAR-10 train+test, apply transforms, and return the requested split.
+    Load train+test data, apply transforms, and return the requested split.
 
     Training splits (target, shadow) get data augmentation.
     Evaluation splits (validation, reference) get normalisation only.
@@ -89,26 +104,47 @@ def load_dataset(args, data_type="target"):
     mean = args.data_mean
     std  = args.data_std
     normalize = transforms.Normalize(mean, std)
+    dataset_name = getattr(args, "dataset", "cifar10").lower()
 
-    if data_type in ("target", "shadow"):
-        transform = transforms.Compose([
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ])
-    else:
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-            normalize,
-        ])
-
-    train_ds = torchvision.datasets.CIFAR10(
-        root=args.data_dir, train=True, download=True, transform=transform
-    )
-    test_ds = torchvision.datasets.CIFAR10(
-        root=args.data_dir, train=False, download=True, transform=transform
-    )
+    if dataset_name in ("mnist", "fmnist"):
+        ds_cls = (torchvision.datasets.MNIST if dataset_name == "mnist"
+                  else torchvision.datasets.FashionMNIST)
+        if data_type in ("target", "shadow"):
+            transform = transforms.Compose([
+                transforms.RandomAffine(degrees=10, translate=(0.1, 0.1)),
+                transforms.ToTensor(),
+                normalize,
+            ])
+        else:
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                normalize,
+            ])
+        train_ds = ds_cls(
+            root=args.data_dir, train=True, download=True, transform=transform
+        )
+        test_ds = ds_cls(
+            root=args.data_dir, train=False, download=True, transform=transform
+        )
+    else:  # cifar10
+        if data_type in ("target", "shadow"):
+            transform = transforms.Compose([
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                normalize,
+            ])
+        else:
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                normalize,
+            ])
+        train_ds = torchvision.datasets.CIFAR10(
+            root=args.data_dir, train=True, download=True, transform=transform
+        )
+        test_ds = torchvision.datasets.CIFAR10(
+            root=args.data_dir, train=False, download=True, transform=transform
+        )
 
     full_dataset = ConcatDataset([train_ds, test_ds])
     return split_dataset_for_type(

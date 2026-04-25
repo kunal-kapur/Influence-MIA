@@ -93,10 +93,14 @@ def run(
     min_gmm_buckets: int = 4,
     max_gmm_buckets: int = 20,
 ) -> None:
-    config_dir = "config"
-    yaml_path  = os.path.join(config_dir, f"{dataset}.yaml")
-    yml_path   = os.path.join(config_dir, f"{dataset}.yml")
-    cfg_path   = yaml_path if os.path.exists(yaml_path) else yml_path
+    saved_cfg_path = os.path.join(exp_dir, "config.yaml")
+    if os.path.exists(saved_cfg_path):
+        cfg_path = saved_cfg_path
+    else:
+        config_dir = "config"
+        yaml_path  = os.path.join(config_dir, f"{dataset}.yaml")
+        yml_path   = os.path.join(config_dir, f"{dataset}.yml")
+        cfg_path   = yaml_path if os.path.exists(yaml_path) else yml_path
     with open(cfg_path) as f:
         cfg = yaml.safe_load(f)
     n_shadow_models = cfg["n_shadow_models"]

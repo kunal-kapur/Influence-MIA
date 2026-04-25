@@ -67,8 +67,8 @@ def _load_checkpoint(ckpt_path, student, optimizer, scheduler, device):
     return ckpt["epoch"] + 1, best_val_acc
 
 
-def _flush_state_dict(state_dict, path, num_classes):
-    m = ResNet18_Influence(num_classes=num_classes)
+def _flush_state_dict(state_dict, path, num_classes, in_channels=3):
+    m = ResNet18_Influence(num_classes=num_classes, in_channels=in_channels)
     m.load_state_dict(state_dict)
     save_model(m, path)
     del m
@@ -123,7 +123,10 @@ def train_shadow(args, shadow_id, device):
     # ------------------------------------------------------------------
     # 2. Student model + optimiser
     # ------------------------------------------------------------------
-    student   = ResNet18_Influence(num_classes=args.num_classes).to(device)
+    student   = ResNet18_Influence(
+        num_classes=args.num_classes,
+        in_channels=getattr(args, "in_channels", 3),
+    ).to(device)
     optimizer = build_optimizer(args, student.parameters())
     scheduler = build_scheduler(args, optimizer)
 
@@ -144,7 +147,10 @@ def train_shadow(args, shadow_id, device):
         print(f"[shadow {shadow_id}] Resumed at epoch {start_epoch}, "
               f"best_val_acc so far: {best_val_acc:.4f}")
         if os.path.exists(model_path):
-            tmp = ResNet18_Influence(num_classes=args.num_classes)
+            tmp = ResNet18_Influence(
+                num_classes=args.num_classes,
+                in_channels=getattr(args, "in_channels", 3),
+            )
             tmp = load_model(tmp, model_path, torch.device("cpu"))
             best_model_state = tmp.state_dict()
             del tmp
@@ -183,7 +189,7 @@ def train_shadow(args, shadow_id, device):
                 name: tensor.detach().cpu().clone()
                 for name, tensor in student.state_dict().items()
             }
-            _flush_state_dict(best_model_state, model_path, args.num_classes)
+            _flush_state_dict(best_model_state, model_path, args.num_classes, getattr(args, "in_channels", 3))
 
         if scheduler is not None:
             scheduler.step()
@@ -212,7 +218,7 @@ def train_shadow(args, shadow_id, device):
     # ------------------------------------------------------------------
     # 6. Save final outputs
     # ------------------------------------------------------------------
-    _flush_state_dict(best_model_state, model_path, args.num_classes)
+    _flush_state_dict(best_model_state, model_path, args.num_classes, getattr(args, "in_channels", 3))
     print(f"[shadow {shadow_id}] Best val accuracy: {best_val_acc:.4f}  "
           f"Model saved to {model_path}")
 

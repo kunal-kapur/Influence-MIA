@@ -22,6 +22,7 @@ import torch
 
 from training.train_shadow import train_shadow
 from training.compute_influence import compute_influence
+from data.loader import get_dataset
 
 
 def _load_config(dataset: str) -> types.SimpleNamespace:
@@ -107,6 +108,7 @@ def main() -> None:
     cfg = _load_config(cli.dataset)
     args = types.SimpleNamespace(**vars(cfg))
     args.dataset = cli.dataset
+    get_dataset(args)  # sets args.in_channels, data_mean, data_std, num_classes
 
     # Build experiment directory: <output_dir>/<exp_name>/<dataset>/
     exp_name = _make_exp_name(args)

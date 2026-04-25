@@ -32,6 +32,7 @@ from training.train_target import train_target
 from training.train_shadow import train_shadow
 from training.compute_influence import compute_influence
 from experiments.analyze import run as run_analysis
+from data.loader import get_dataset
 
 
 # ---------------------------------------------------------------------------
@@ -72,9 +73,20 @@ def _make_args(cli: argparse.Namespace) -> types.SimpleNamespace:
     cfg = _load_config(cli.dataset)
     args = types.SimpleNamespace(**vars(cfg))
     args.dataset = cli.dataset
+    get_dataset(args)  # sets args.in_channels, data_mean, data_std, num_classes
     exp_name = cli.exp_name if cli.exp_name else _make_exp_name(args)
     args.exp_dir = str(Path(cli.output_dir) / exp_name / cli.dataset)
+    _save_config(args)
     return args
+
+
+def _save_config(args: types.SimpleNamespace) -> None:
+    """Persist the resolved config to exp_dir/config.yaml so analysis can reconstruct it."""
+    os.makedirs(args.exp_dir, exist_ok=True)
+    cfg_out = os.path.join(args.exp_dir, "config.yaml")
+    if not os.path.exists(cfg_out):
+        with open(cfg_out, "w") as f:
+            yaml.dump(vars(args), f, default_flow_style=False)
 
 
 def _parse_args() -> argparse.Namespace:
