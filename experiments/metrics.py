@@ -5,7 +5,7 @@ from scipy.stats import norm
 from sklearn.metrics import roc_auc_score, roc_curve
 
 
-def fit_fixed_zero_rightshift_mixture(
+def fit_rightshift_mixture(
     x,
     max_iter=200,
     tol=1e-6,
@@ -16,16 +16,18 @@ def fit_fixed_zero_rightshift_mixture(
 ):
     """Fit a constrained 1D mixture:
 
-        p(x) = pi_out * N(x; 0, var_out) + pi_in * N(x; mu_in, var_in)
+        p(x) = pi_out * N(x; mu_out, var_out) + pi_in * N(x; mu_in, var_in)
 
-    mu_out is fixed at 0.  mu_in is clamped to >= mu_in_min after each M-step.
+    Both mu_out and mu_in are free parameters updated each M-step.
+    mu_in is clamped to >= mu_in_min after each M-step.
     Returns a dict with posteriors, parameters, convergence flag, reliability
     flag, and the posterior-equality threshold.
     """
     x = np.asarray(x, dtype=float)
     N = len(x)
 
-    mu_in  = max(float(np.percentile(x, 75)), mu_in_min)
+    mu_out  = float(np.percentile(x, 25))
+    mu_in   = max(float(np.percentile(x, 75)), mu_in_min)
     var_out = max(float(np.var(x)) * 0.5, min_var)
     var_in  = max(float(np.var(x)) * 0.5, min_var)
     pi_out  = 0.5
@@ -35,8 +37,8 @@ def fit_fixed_zero_rightshift_mixture(
     converged   = False
 
     for _ in range(max_iter):
-        log_p_out = np.log(pi_out + 1e-300) + norm.logpdf(x, 0.0, np.sqrt(var_out))
-        log_p_in  = np.log(pi_in  + 1e-300) + norm.logpdf(x, mu_in, np.sqrt(var_in))
+        log_p_out = np.log(pi_out + 1e-300) + norm.logpdf(x, mu_out, np.sqrt(var_out))
+        log_p_in  = np.log(pi_in  + 1e-300) + norm.logpdf(x, mu_in,  np.sqrt(var_in))
 
         log_sum = np.logaddexp(log_p_out, log_p_in)
         r_out   = np.exp(log_p_out - log_sum)
@@ -51,20 +53,23 @@ def fit_fixed_zero_rightshift_mixture(
         pi_out = n_out / total
         pi_in  = n_in  / total
 
+        mu_out = float(np.dot(r_out, x) / (n_out + 1e-300))
         mu_in_unconstrained = float(np.dot(r_in, x) / (n_in + 1e-300))
         mu_in = max(mu_in_unconstrained, mu_in_min)
 
-        var_out = max(float(np.dot(r_out, x ** 2) / (n_out + 1e-300)), min_var)
-        var_in  = max(float(np.dot(r_in, (x - mu_in) ** 2) / (n_in + 1e-300)), min_var)
+        var_out = max(float(np.dot(r_out, (x - mu_out) ** 2) / (n_out + 1e-300)), min_var)
+        var_in  = max(float(np.dot(r_in,  (x - mu_in)  ** 2) / (n_in  + 1e-300)), min_var)
 
         if abs(loglik - prev_loglik) < tol:
             converged = True
             break
         prev_loglik = loglik
 
-    t_grid = np.linspace(0.0, mu_in * 2.5, 2000)
-    d_out  = pi_out * norm.pdf(t_grid, 0.0, np.sqrt(var_out))
-    d_in   = pi_in  * norm.pdf(t_grid, mu_in, np.sqrt(var_in))
+    t_lo   = min(mu_out, mu_in)
+    t_hi   = max(mu_out, mu_in) * 2.5
+    t_grid = np.linspace(t_lo, t_hi, 2000)
+    d_out  = pi_out * norm.pdf(t_grid, mu_out, np.sqrt(var_out))
+    d_in   = pi_in  * norm.pdf(t_grid, mu_in,  np.sqrt(var_in))
     sign_changes = np.where(np.diff(np.sign(d_in - d_out)))[0]
     threshold = None
     if len(sign_changes) > 0:
@@ -85,18 +90,19 @@ def fit_fixed_zero_rightshift_mixture(
         reliable = False
         reason   = f"variance degenerate (var_out={var_out:.4f}, var_in={var_in:.4f})"
 
-    log_p_in_density  = norm.logpdf(x, mu_in, np.sqrt(var_in))
-    log_p_out_density = norm.logpdf(x,   0.0, np.sqrt(var_out))
+    log_p_in_density  = norm.logpdf(x, mu_in,  np.sqrt(var_in))
+    log_p_out_density = norm.logpdf(x, mu_out, np.sqrt(var_out))
     llr = log_p_in_density - log_p_out_density
 
-    bc_term1 = 0.25 * (mu_in ** 2) / (var_in + var_out)
+    delta_mu = mu_in - mu_out
+    bc_term1 = 0.25 * (delta_mu ** 2) / (var_in + var_out)
     bc_term2 = 0.5 * np.log((var_in + var_out) / (2.0 * np.sqrt(var_in * var_out)))
     bhattacharyya = bc_term1 + bc_term2
 
     return {
         "pi_out":         pi_out,
         "pi_in":          pi_in,
-        "mu_out":         0.0,
+        "mu_out":         mu_out,
         "mu_in":          mu_in,
         "var_out":        var_out,
         "var_in":         var_in,
@@ -110,6 +116,11 @@ def fit_fixed_zero_rightshift_mixture(
         "reason":         reason,
         "threshold":      threshold,
     }
+
+
+def fit_fixed_zero_rightshift_mixture(*args, **kwargs):
+    """Deprecated alias — use fit_rightshift_mixture instead."""
+    return fit_rightshift_mixture(*args, **kwargs)
 
 
 def tpr_at_fpr(fpr, tpr, max_fpr=0.01):
@@ -167,7 +178,7 @@ def gmm_aggregate_mia_scores(
             llr_scores[idx] = centred / max((len(idx) - 1) / 2.0, 1.0)
             continue
 
-        fit = fit_fixed_zero_rightshift_mixture(mia_scores[idx])
+        fit = fit_rightshift_mixture(mia_scores[idx])
         if verbose:
             print(
                 f"  [Bucket {b}] n={len(idx)}: "

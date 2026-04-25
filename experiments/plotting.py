@@ -10,7 +10,7 @@ import numpy as np
 from scipy.stats import norm
 from sklearn.metrics import roc_auc_score, roc_curve
 
-from .metrics import fit_fixed_zero_rightshift_mixture, tpr_at_fpr
+from .metrics import fit_rightshift_mixture, tpr_at_fpr
 
 
 def plot_bucket_mia_hist(mia_scores, ground_truth, bucket_indices, bucket_id,
@@ -116,7 +116,7 @@ def plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, out_d
         fig, ax = plt.subplots(figsize=(7.2, 4.8))
 
         if len(idx) >= min_points:
-            fit = fit_fixed_zero_rightshift_mixture(bucket_scores)
+            fit = fit_rightshift_mixture(bucket_scores)
             thr_str = f"{fit['threshold']:.3f}" if fit["threshold"] is not None else "none"
             print(
                 f"  [Bucket {b}] n={len(idx)}: "
@@ -148,7 +148,7 @@ def plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, out_d
                 except Exception:
                     pass
 
-            pdf_out   = fit["pi_out"] * norm.pdf(x_grid, 0.0, np.sqrt(fit["var_out"]))
+            pdf_out   = fit["pi_out"] * norm.pdf(x_grid, fit["mu_out"], np.sqrt(fit["var_out"]))
             pdf_in    = fit["pi_in"]  * norm.pdf(x_grid, fit["mu_in"], np.sqrt(fit["var_in"]))
             total_pdf = pdf_out + pdf_in
             p_in      = fit["posterior_in"]
@@ -178,10 +178,10 @@ def plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, out_d
         if total_pdf is not None:
             ax.plot(x_grid, total_pdf, color="black",      linewidth=2.0, label="mixture total")
             ax.plot(x_grid, pdf_out,   color="darkorange",  linewidth=1.8,
-                    linestyle="--", label=f"OUT  μ=0  σ={np.sqrt(fit['var_out']):.2f}")
+                    linestyle="--", label=f"OUT  μ={fit['mu_out']:.2f}  σ={np.sqrt(fit['var_out']):.2f}")
             ax.plot(x_grid, pdf_in,    color="purple",      linewidth=1.8,
                     linestyle="--", label=f"IN   μ={fit['mu_in']:.2f}  σ={np.sqrt(fit['var_in']):.2f}")
-            ax.axvline(0.0,           color="darkorange", linestyle=":", linewidth=1.2)
+            ax.axvline(fit["mu_out"], color="darkorange", linestyle=":", linewidth=1.2)
             ax.axvline(fit["mu_in"],  color="purple",     linestyle=":", linewidth=1.2)
             if fit["threshold"] is not None:
                 ax.axvline(fit["threshold"], color="gray", linestyle="-.", linewidth=1.0,
