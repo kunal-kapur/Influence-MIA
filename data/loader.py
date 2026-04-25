@@ -1,7 +1,8 @@
 import torch
-from torch.utils.data import ConcatDataset, random_split
+from torch.utils.data import ConcatDataset, random_split, Subset
 import torchvision
 import torchvision.transforms as transforms
+import numpy as np
 
 
 def get_dataset(args):
@@ -50,6 +51,34 @@ def offline_data_split(dataset, seed, data_type):
     }[data_type]
 
 
+def _maybe_shrink_target_pool(target_split, seed, shared_pool_size):
+    """Optionally shrink the target split to a deterministic smaller pool."""
+    if shared_pool_size is None:
+        return target_split
+
+    shared_pool_size = int(shared_pool_size)
+    if shared_pool_size <= 0:
+        raise ValueError(f"shared_pool_size must be positive, got {shared_pool_size}.")
+
+    if shared_pool_size >= len(target_split):
+        return target_split
+
+    # target_split is a Subset over the full dataset. We sample directly in
+    # global index space to keep downstream index mapping simple.
+    global_indices = np.asarray(target_split.indices, dtype=np.int64)
+    rng = np.random.default_rng(seed)
+    chosen = np.sort(rng.choice(global_indices, size=shared_pool_size, replace=False))
+    return Subset(target_split.dataset, chosen.tolist())
+
+
+def split_dataset_for_type(dataset, seed, data_type, shared_pool_size=None):
+    """Return a deterministic split, with optional shrinking for target pool."""
+    split = offline_data_split(dataset, seed, data_type)
+    if data_type == "target":
+        return _maybe_shrink_target_pool(split, seed, shared_pool_size)
+    return split
+
+
 def load_dataset(args, data_type="target"):
     """
     Load CIFAR-10 train+test, apply transforms, and return the requested split.
@@ -82,4 +111,9 @@ def load_dataset(args, data_type="target"):
     )
 
     full_dataset = ConcatDataset([train_ds, test_ds])
-    return offline_data_split(full_dataset, args.seed, data_type)
+    return split_dataset_for_type(
+        full_dataset,
+        seed=args.seed,
+        data_type=data_type,
+        shared_pool_size=getattr(args, "shared_pool_size", None),
+    )

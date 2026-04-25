@@ -3,7 +3,7 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset, random_split
+from torch.utils.data import DataLoader, random_split
 
 from data import load_dataset
 from models import ResNet18_Influence
@@ -54,28 +54,52 @@ def train_target(args, device):
         target_pool, [n_train, n_nonmember], generator=generator
     )
 
-    # Pool-relative indices (0 .. pool_size-1)
-    train_pool_indices    = np.array(train_ds.indices,     dtype=np.int64)
+    # target_pool is a torch Subset over the full CIFAR-10 train+test concat.
+    # We keep metadata in full-dataset global index space.
+    target_pool_global_indices = np.asarray(target_pool.indices, dtype=np.int64)
+    train_pool_indices = np.array(train_ds.indices, dtype=np.int64)
     nonmember_pool_indices = np.array(nonmember_ds.indices, dtype=np.int64)
 
+    # Convert local target-pool indices to global dataset indices.
+    train_global_indices = target_pool_global_indices[train_pool_indices]
+    target_nonmember_global_indices = target_pool_global_indices[nonmember_pool_indices]
+
     # ------------------------------------------------------------------
-    # 3. Build a balanced query set  D_query = D_a ∪ D_b
-    #    D_a ⊂ D_train      (member     queries)
-    #    D_b ⊂ D \ D_train  (non-member queries)
-    #    |D_a| = |D_b| = min(n_train, n_nonmember)
+    # 3. Build a balanced query set D_query = D_a ∪ D_b in global index space.
+    #    D_a ⊂ D_train                  (member queries)
+    #    D_b ⊂ (D \ D_train)            (non-member queries inside shared pool D)
+    #    |D_a| = |D_b| = min(|D_train|, |D \ D_train|)
     # ------------------------------------------------------------------
-    n_query_half = min(n_train, n_nonmember)
+    n_query_half = min(len(train_global_indices), len(target_nonmember_global_indices))
 
     rng = np.random.default_rng(args.seed)
-    da_pool_indices = rng.choice(train_pool_indices,    n_query_half, replace=False)
-    db_pool_indices = rng.choice(nonmember_pool_indices, n_query_half, replace=False)
+    da_global_indices = rng.choice(train_global_indices, n_query_half, replace=False)
+    db_global_indices = rng.choice(target_nonmember_global_indices, n_query_half, replace=False)
 
-    # query_pool_indices: pool-relative positions of each query point,
-    # in the order [Da members ... Db non-members].
-    query_pool_indices = np.concatenate([da_pool_indices, db_pool_indices])  # (2*n_query_half,)
-    n_query = len(query_pool_indices)
+    # query_global_indices are full-dataset indices in fixed order:
+    # [Da members ... Db non-members].
+    query_global_indices = np.concatenate([da_global_indices, db_global_indices])
+    n_query = len(query_global_indices)
 
-    # ground_truth[i] = 1 if query point i is a member of D_train, else 0.
+    # Dataset integrity checks for the MIA threat-model assumptions.
+    assert n_train + n_nonmember <= pool_size, (
+        f"target split sizes exceed shared pool: train={n_train}, "
+        f"nonmember={n_nonmember}, pool={pool_size}"
+    )
+    assert n_query <= pool_size, (
+        f"query set size {n_query} exceeds shared pool size {pool_size}."
+    )
+    query_outside_pool = np.setdiff1d(
+        query_global_indices,
+        target_pool_global_indices,
+        assume_unique=False,
+    )
+    assert len(query_outside_pool) == 0, (
+        "query set must be drawn exclusively from shared pool D; "
+        f"found {len(query_outside_pool)} points outside D"
+    )
+
+    # ground_truth[i] = 1 if query point i is a target member, else 0.
     ground_truth = np.zeros(n_query, dtype=np.int32)
     ground_truth[:n_query_half] = 1  # first half are Da (members)
 
@@ -158,20 +182,20 @@ def train_target(args, device):
     # ------------------------------------------------------------------
     # 8. Save metadata
     #
-    # target_train_indices.npy  — pool-relative indices of D_train  (n_train,)
-    # query_indices.npy         — pool-relative indices of D_query  (2*n_query_half,)
-    #                             order: [Da members | Db non-members]
+    # target_train_indices.npy  — global indices of D_train  (n_train,)
+    # query_indices.npy         — global indices of D_query  (2*n_query_half,)
+    #                             order: [Da members | Db in-pool non-members]
     # ground_truth.npy          — 1/0 membership labels aligned to query_indices (n_query,)
     # ------------------------------------------------------------------
-    save_array(train_pool_indices,  os.path.join(args.exp_dir, "target_train_indices.npy"))
-    save_array(query_pool_indices,  os.path.join(args.exp_dir, "query_indices.npy"))
-    save_array(ground_truth,        os.path.join(args.exp_dir, "ground_truth.npy"))
+    save_array(train_global_indices, os.path.join(args.exp_dir, "target_train_indices.npy"))
+    save_array(query_global_indices, os.path.join(args.exp_dir, "query_indices.npy"))
+    save_array(ground_truth,         os.path.join(args.exp_dir, "ground_truth.npy"))
 
     print(
         f"[target] Saved metadata:\n"
-        f"  target_train_indices : {n_train} points\n"
+        f"  target_train_indices : {n_train} points (global indices)\n"
         f"  query_indices        : {n_query} points  "
-        f"({n_query_half} members + {n_query_half} non-members)\n"
+        f"({n_query_half} members + {n_query_half} in-pool non-members)\n"
         f"  ground_truth         : {ground_truth.sum()} members, "
         f"{(ground_truth == 0).sum()} non-members"
     )

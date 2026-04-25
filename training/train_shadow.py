@@ -1,17 +1,13 @@
-"""Shadow model training on the shadow pool using CE loss only.
+"""Shadow model training on the shared target/shadow pool using CE loss only.
 
 Threat model / data layout
 --------------------------
-target pool  (D)       : 20 000 points — the candidate set the target model
-                         was trained on.  The query set D_query ⊂ D is a
-                         balanced subset saved by train_target.py.
+shared pool (D)        : 20 000 points used by both target and shadow models
+                         as the candidate pool.
 
-shadow pool            : 20 000 *disjoint* points used only for shadow training.
-                         Shadows never see target-pool data during training.
-
-query set (D_query)    : fixed balanced set of n_query points (members + non-
-                         members from D) saved as query_indices.npy by
-                         train_target.py.
+query set (D_query)    : fixed balanced set of n_query points (members from
+                         target train split + in-pool non-members from D\D_train),
+                         saved as query_indices.npy by train_target.py.
 
 Outputs (per shadow_id)
 -----------------------
@@ -19,7 +15,6 @@ Outputs (per shadow_id)
 {exp_dir}/shadows/{shadow_id}/checkpoint.pt     (overwritten each epoch)
 """
 
-import copy
 import gc
 import os
 
@@ -39,14 +34,9 @@ from utils.io import save_model, load_model
 # ---------------------------------------------------------------------------
 
 def _build_shadow_pool(args):
-    """Return the shadow pool with augmentation.
-
-    Shadow models train exclusively on the shadow pool (disjoint from the
-    target pool).  Never pass data_type='target' here — that would let shadow
-    models see target-pool data, violating the threat model.
-    """
+    """Return the shared target/shadow pool with augmentation."""
     get_dataset(args)  # sets args.data_mean, args.data_std, args.num_classes
-    return load_dataset(args, data_type="shadow")
+    return load_dataset(args, data_type="target")
 
 
 def _shadow_dir(args, shadow_id):
@@ -89,7 +79,7 @@ def _flush_state_dict(state_dict, path, num_classes):
 # ---------------------------------------------------------------------------
 
 def train_shadow(args, shadow_id, device):
-    """Train a single shadow model on the shadow pool using CE loss only."""
+    """Train a single shadow model on the shared pool using CE loss only."""
     out_dir    = _shadow_dir(args, shadow_id)
     model_path = os.path.join(out_dir, "shadow_model.pt")
     ckpt_path  = os.path.join(out_dir, "checkpoint.pt")
@@ -97,7 +87,7 @@ def train_shadow(args, shadow_id, device):
     os.makedirs(out_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
-    # 1. Shadow pool — training data (disjoint from target pool)
+    # 1. Shared pool — same candidate pool used by target and shadows
     # ------------------------------------------------------------------
     shadow_pool = _build_shadow_pool(args)
     shadow_pool_size = len(shadow_pool)
@@ -189,8 +179,10 @@ def train_shadow(args, shadow_id, device):
         print(f"[shadow {shadow_id}] Epoch [{epoch:3d}/{args.epochs}]  val_acc={val_acc:.4f}")
         if val_acc > best_val_acc:
             best_val_acc     = val_acc
-            best_model_state = copy.deepcopy(student.cpu().state_dict())
-            student.to(device)
+            best_model_state = {
+                name: tensor.detach().cpu().clone()
+                for name, tensor in student.state_dict().items()
+            }
             _flush_state_dict(best_model_state, model_path, args.num_classes)
 
         if scheduler is not None:
@@ -199,8 +191,10 @@ def train_shadow(args, shadow_id, device):
         _save_checkpoint(out_dir, epoch, student, optimizer, scheduler, best_val_acc)
 
     if best_model_state is None:
-        best_model_state = copy.deepcopy(student.cpu().state_dict())
-        student.to(device)
+        best_model_state = {
+            name: tensor.detach().cpu().clone()
+            for name, tensor in student.state_dict().items()
+        }
 
     del student, optimizer, scheduler
     gc.collect()

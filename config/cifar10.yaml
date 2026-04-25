@@ -15,5 +15,6 @@ epochs: 80
 batch_size: 256
 pkeep: 0.5
 num_workers: 1
-n_shadow_models: 10
+n_shadow_models: 20
 imitate_acc: 0.6        # kept for compatibility, not used in non-adaptive training
+shared_pool_size: 10000 # smaller shared pool used by both target and shadow training

@@ -13,8 +13,8 @@ to the shadow models' baseline expectation, without requiring IN/OUT Gaussian
 fitting (which is invalid when shadow pools are disjoint from the query set).
 
 We bucket points by each influence score and compute:
-  - Pearson correlation with mia_score
-  - TPR @ 0% FPR, TPR @ 0.1% FPR, TPR @ 1% FPR, and Balanced Accuracy per bucket
+    - Pearson correlation with mia_score
+    - TPR @ 0% FPR, TPR @ 0.1% FPR, TPR @ 1% FPR, and Balanced Accuracy per bucket
 
 Usage
 -----
@@ -42,6 +42,8 @@ from sklearn.metrics import roc_curve
 from torch.utils.data import ConcatDataset, DataLoader, Subset
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from data.loader import split_dataset_for_type
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +159,12 @@ def fit_fixed_zero_rightshift_mixture(
 # Load all shadow artifacts
 # ---------------------------------------------------------------------------
 
-def _load_shadow_data(exp_dir: str, n_shadow_models: int, n_query: int):
+def _load_shadow_data(
+    exp_dir: str,
+    n_shadow_models: int,
+    n_query: int,
+    query_global_indices: np.ndarray,
+):
     """Load per-shadow arrays aligned to query_indices.
 
     Returns
@@ -172,6 +179,7 @@ def _load_shadow_data(exp_dir: str, n_shadow_models: int, n_query: int):
         lira_path  = os.path.join(d, "lira_stats.npy")
         clira_path = os.path.join(d, "C_lira.npy")
         closs_path = os.path.join(d, "C_loss.npy")
+        meta_path  = os.path.join(d, "influence_meta.npz")
 
         if not os.path.exists(lira_path):
             print(f"  [shadow {k}] lira_stats.npy missing — skipping.")
@@ -189,6 +197,18 @@ def _load_shadow_data(exp_dir: str, n_shadow_models: int, n_query: int):
             "Re-run compute_influence for this shadow."
         )
 
+        if os.path.exists(meta_path):
+            meta = np.load(meta_path)
+            if "query_indices" in meta:
+                cached_q = meta["query_indices"].astype(np.int64)
+                assert cached_q.shape == query_global_indices.shape and np.array_equal(
+                    cached_q, query_global_indices
+                ), (
+                    f"[shadow {k}] influence_meta query_indices mismatch with current "
+                    "query_indices.npy. Re-run compute_influence for this shadow to fix "
+                    "gradient/index alignment."
+                )
+
         lira_stats.append(ls)
         C_lira.append(cl)
         C_loss.append(np.load(closs_path) if os.path.exists(closs_path) else None)
@@ -205,7 +225,7 @@ def _load_query_metadata(exp_dir: str):
 
     Returns
     -------
-    query_pool_indices : (n_query,) int64 — pool-relative index of each query point
+    query_global_indices : (n_query,) int64 — global index of each query point
     ground_truth       : (n_query,) int32 — 1 = member, 0 = non-member
     """
     qi_path = os.path.join(exp_dir, "query_indices.npy")
@@ -222,11 +242,11 @@ def _load_query_metadata(exp_dir: str):
             "Run train_target.py first."
         )
 
-    query_pool_indices = np.load(qi_path).astype(np.int64)
+    query_global_indices = np.load(qi_path).astype(np.int64)
     ground_truth       = np.load(gt_path).astype(np.int32)
 
-    assert query_pool_indices.shape == ground_truth.shape, (
-        f"query_indices shape {query_pool_indices.shape} != "
+    assert query_global_indices.shape == ground_truth.shape, (
+        f"query_indices shape {query_global_indices.shape} != "
         f"ground_truth shape {ground_truth.shape}."
     )
     members    = int(ground_truth.sum())
@@ -234,7 +254,81 @@ def _load_query_metadata(exp_dir: str):
     assert members == nonmembers, (
         f"Query set is not balanced: {members} members vs {nonmembers} non-members."
     )
-    return query_pool_indices, ground_truth
+    return query_global_indices, ground_truth
+
+
+def _build_target_pool_global_indices(cfg: dict) -> np.ndarray:
+    """Reconstruct shared pool D global indices exactly as in training."""
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(cfg["data_mean"], cfg["data_std"]),
+    ])
+    train_ds = torchvision.datasets.CIFAR10(
+        root=cfg["data_dir"], train=True, download=False, transform=transform
+    )
+    test_ds = torchvision.datasets.CIFAR10(
+        root=cfg["data_dir"], train=False, download=False, transform=transform
+    )
+    target_pool = split_dataset_for_type(
+        ConcatDataset([train_ds, test_ds]),
+        seed=cfg["seed"],
+        data_type="target",
+        shared_pool_size=cfg.get("shared_pool_size"),
+    )
+    return np.asarray(target_pool.indices, dtype=np.int64)
+
+
+def _assert_query_has_in_out_shadow_coverage(cfg: dict, query_global_indices: np.ndarray) -> None:
+    """Ensure each query point has at least one IN and one OUT shadow model."""
+    target_pool_global_indices = _build_target_pool_global_indices(cfg)
+    outside_pool = np.setdiff1d(
+        query_global_indices,
+        target_pool_global_indices,
+        assume_unique=False,
+    )
+    assert len(outside_pool) == 0, (
+        "Query set contains points outside shared pool D; "
+        f"found {len(outside_pool)} such points."
+    )
+
+    pool_size = len(target_pool_global_indices)
+    sorter = np.argsort(target_pool_global_indices)
+    sorted_globals = target_pool_global_indices[sorter]
+    pos = np.searchsorted(sorted_globals, query_global_indices)
+    assert np.all(sorted_globals[pos] == query_global_indices), (
+        "Failed to map some query points into shared pool D."
+    )
+    query_local_indices = sorter[pos]
+
+    n_shadow_models = int(cfg["n_shadow_models"])
+    in_size = int(cfg["pkeep"] * pool_size)
+    assert in_size > 0 and in_size < pool_size, (
+        f"Invalid shadow IN subset size {in_size} for pool size {pool_size}."
+    )
+
+    in_counts = np.zeros(len(query_local_indices), dtype=np.int32)
+    for shadow_id in range(n_shadow_models):
+        rs = np.random.RandomState(2025 + shadow_id)
+        shadow_in_local = rs.choice(pool_size, in_size, replace=False)
+        in_mask = np.zeros(pool_size, dtype=bool)
+        in_mask[shadow_in_local] = True
+        in_counts += in_mask[query_local_indices].astype(np.int32)
+
+    out_counts = n_shadow_models - in_counts
+    min_in = int(in_counts.min())
+    min_out = int(out_counts.min())
+    print(
+        "  Query IN/OUT shadow coverage: "
+        f"min_IN={min_in}, min_OUT={min_out}, "
+        f"avg_IN={in_counts.mean():.2f}, avg_OUT={out_counts.mean():.2f}"
+    )
+
+    assert min_in > 0, (
+        "At least one query point has 0 IN shadows, which invalidates LiRA IN-distribution fitting."
+    )
+    assert min_out > 0, (
+        "At least one query point has 0 OUT shadows, which invalidates LiRA OUT-distribution fitting."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -242,26 +336,27 @@ def _load_query_metadata(exp_dir: str):
 # ---------------------------------------------------------------------------
 
 def _compute_target_lira_scores(exp_dir: str, cfg: dict,
-                                 query_pool_indices: np.ndarray) -> np.ndarray:
+                                 query_global_indices: np.ndarray) -> np.ndarray:
     """Evaluate the target model on D_query and return scaled logits.
 
     Returns (n_query,) array of log(p_true / (1 - p_true)).
 
-    The loader iterates over query_pool_indices in order so that output[i]
+    The loader iterates over query_global_indices in order so that output[i]
     corresponds to query point i — the same ordering used by lira_stats,
     C_lira, in_mask, and ground_truth.
     """
     from models.resnet import ResNet18_Influence
-    from data.loader import offline_data_split
-
     target_path = os.path.join(exp_dir, "target_model.pt")
     if not os.path.exists(target_path):
         raise FileNotFoundError(
             f"Target model not found at {target_path}. Run train_target.py first."
         )
+    assert os.path.basename(target_path) == "target_model.pt", (
+        "Target score computation must use target_model.pt."
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model  = ResNet18_Influence().to(device)
+    model  = ResNet18_Influence(num_classes=int(cfg["num_classes"])).to(device)
     state_dict = torch.load(target_path, map_location=device, weights_only=False)
     if "model_state_dict" in state_dict:
         model.load_state_dict(state_dict["model_state_dict"])
@@ -284,12 +379,17 @@ def _compute_target_lira_scores(exp_dir: str, cfg: dict,
     )
     full_dataset = ConcatDataset([train_ds, test_ds])
 
-    # Reconstruct the target pool — must match the seed used during training
-    target_pool = offline_data_split(full_dataset, cfg["seed"], "target")
-
-    # Subset to the query points in query_indices order (no shuffling)
-    query_ds = Subset(target_pool, query_pool_indices.tolist())
-    loader   = DataLoader(query_ds, batch_size=256, shuffle=False, num_workers=2)
+    # Subset to the query points in query_indices order (no shuffling).
+    # query_indices are global indices over full_dataset.
+    query_ds = Subset(full_dataset, query_global_indices.tolist())
+    loader   = DataLoader(
+        query_ds,
+        batch_size=256,
+        shuffle=False,
+        drop_last=False,
+        num_workers=2,
+        pin_memory=(device.type == "cuda"),
+    )
 
     scores = []
     with torch.no_grad():
@@ -302,7 +402,7 @@ def _compute_target_lira_scores(exp_dir: str, cfg: dict,
             scores.append(torch.log(p_true / (1.0 - p_true)).cpu().numpy())
 
     result = np.concatenate(scores)
-    n_query = len(query_pool_indices)
+    n_query = len(query_global_indices)
     assert result.shape == (n_query,), (
         f"Target score array shape {result.shape} != (n_query={n_query},). "
         "Pool reconstruction or query_indices may be misaligned."
@@ -337,6 +437,7 @@ def _gmm_aggregate_mia_scores(
     influence_scores: np.ndarray,
     mia_scores: np.ndarray,
     num_buckets: int = 10,
+    verbose: bool = True,
 ) -> np.ndarray:
     """Bucket-wise constrained-mixture aggregation of MIA scores.
 
@@ -358,22 +459,200 @@ def _gmm_aggregate_mia_scores(
             continue
 
         fit = fit_fixed_zero_rightshift_mixture(mia_scores[idx])
-        print(
-            f"  [Bucket {b}] n={len(idx)}: "
-            f"mu_in={fit['mu_in']:.3f}  "
-            f"sd_out={np.sqrt(fit['var_out']):.3f}  "
-            f"sd_in={np.sqrt(fit['var_in']):.3f}  "
-            f"pi_in={fit['pi_in']:.3f}  "
-            f"reliable={fit['reliable']}  "
-            f"converged={fit['converged']}"
-        )
+        if verbose:
+            print(
+                f"  [Bucket {b}] n={len(idx)}: "
+                f"mu_in={fit['mu_in']:.3f}  "
+                f"sd_out={np.sqrt(fit['var_out']):.3f}  "
+                f"sd_in={np.sqrt(fit['var_in']):.3f}  "
+                f"pi_in={fit['pi_in']:.3f}  "
+                f"reliable={fit['reliable']}  "
+                f"converged={fit['converged']}"
+            )
         if not fit["reliable"]:
-            print(f"    -> unreliable: {fit['reason']} — defaulting to p_in=0.5")
+            if verbose:
+                print(f"    -> unreliable: {fit['reason']} — defaulting to p_in=0.5")
             gmm_probs[idx] = 0.5
         else:
             gmm_probs[idx] = fit["posterior_in"]
 
     return gmm_probs
+
+
+def _evaluate_attack_metrics(ground_truth: np.ndarray, scores: np.ndarray) -> dict:
+    fpr, tpr, _ = roc_curve(ground_truth.astype(int), scores)
+    return {
+        "tpr_0pct": _tpr_at_fpr(fpr, tpr, max_fpr=0.0),
+        "tpr_01pct": _tpr_at_fpr(fpr, tpr, max_fpr=0.001),
+        "tpr_1pct": _tpr_at_fpr(fpr, tpr, max_fpr=0.01),
+        "bal_acc": _balanced_accuracy_from_roc(fpr, tpr),
+    }
+
+
+def _adaptive_gmm_bucket_search(
+    ground_truth: np.ndarray,
+    mia_scores: np.ndarray,
+    influence_scores: np.ndarray,
+    min_buckets: int,
+    max_buckets: int,
+
+) -> tuple:
+    """Find strong loss-bucketing counts without a pure grid sweep.
+
+    Uses a staged search:
+      1) coarse candidate sampling over the full range,
+      2) local neighborhood refinement around top seeds,
+      3) fallback to full sweep only for very small ranges.
+
+    Returns (results, best_for_0pct, best_for_001pct, best_for_1pct), where
+    each best entry is a result dict containing bucket count, metrics, and
+    gmm probabilities.
+    """
+    n_query = len(mia_scores)
+    max_reasonable = max(2, min(max_buckets, n_query // 10))
+    min_reasonable = max(2, min(min_buckets, max_reasonable))
+
+    if min_reasonable > max_reasonable:
+        min_reasonable = max_reasonable
+
+    evaluated = {}
+
+    def _eval_bucket_count(num_buckets: int):
+        num_buckets = int(num_buckets)
+        if num_buckets in evaluated:
+            return evaluated[num_buckets]
+        gmm_probs = _gmm_aggregate_mia_scores(
+            influence_scores=influence_scores,
+            mia_scores=mia_scores,
+            num_buckets=num_buckets,
+            verbose=False,
+        )
+        metrics = _evaluate_attack_metrics(ground_truth, gmm_probs)
+        result = {
+            "num_buckets": num_buckets,
+            "metrics": metrics,
+            "gmm_probs": gmm_probs,
+        }
+        evaluated[num_buckets] = result
+        return result
+
+    search_span = max_reasonable - min_reasonable + 1
+
+    # For tiny ranges, exhaustive evaluation is cheap and stable.
+    if search_span <= 8:
+        for nb in range(min_reasonable, max_reasonable + 1):
+            _eval_bucket_count(nb)
+    else:
+        # Stage 1: coarse spread across the range.
+        coarse_points = np.linspace(min_reasonable, max_reasonable, num=8)
+        coarse_candidates = {int(round(v)) for v in coarse_points}
+        coarse_candidates.update({min_reasonable, max_reasonable})
+        for nb in sorted(coarse_candidates):
+            _eval_bucket_count(nb)
+
+        # Stage 2: local refinement near best coarse seeds.
+        def _key_0pct(res):
+            return (
+                res["metrics"]["tpr_0pct"],
+                res["metrics"]["tpr_01pct"],
+                res["metrics"]["tpr_1pct"],
+                res["metrics"]["bal_acc"],
+            )
+
+        def _key_001pct(res):
+            return (
+                res["metrics"]["tpr_01pct"],
+                res["metrics"]["tpr_1pct"],
+                res["metrics"]["tpr_0pct"],
+                res["metrics"]["bal_acc"],
+            )
+
+        def _key_1pct(res):
+            return (
+                res["metrics"]["tpr_1pct"],
+                res["metrics"]["tpr_01pct"],
+                res["metrics"]["tpr_0pct"],
+                res["metrics"]["bal_acc"],
+            )
+
+        coarse_results = list(evaluated.values())
+        seeds = set()
+        for res in sorted(coarse_results, key=_key_0pct, reverse=True)[:2]:
+            seeds.add(res["num_buckets"])
+        for res in sorted(coarse_results, key=_key_001pct, reverse=True)[:2]:
+            seeds.add(res["num_buckets"])
+
+        for seed in sorted(seeds):
+            for radius in (1, 2, 3):
+                for nb in (seed - radius, seed + radius):
+                    if min_reasonable <= nb <= max_reasonable:
+                        _eval_bucket_count(nb)
+
+        # Stage 3: if best candidate lies near boundaries, probe inward.
+        current_best_0 = max(evaluated.values(), key=lambda r: (
+            r["metrics"]["tpr_0pct"],
+            r["metrics"]["tpr_01pct"],
+            r["metrics"]["tpr_1pct"],
+            r["metrics"]["bal_acc"],
+        ))
+        current_best_001 = max(evaluated.values(), key=lambda r: (
+            r["metrics"]["tpr_01pct"],
+            r["metrics"]["tpr_1pct"],
+            r["metrics"]["tpr_0pct"],
+            r["metrics"]["bal_acc"],
+        ))
+        current_best_1 = max(evaluated.values(), key=lambda r: (
+            r["metrics"]["tpr_1pct"],
+            r["metrics"]["tpr_01pct"],
+            r["metrics"]["tpr_0pct"],
+            r["metrics"]["bal_acc"],
+        ))
+        edge_seeds = {
+            current_best_0["num_buckets"],
+            current_best_001["num_buckets"],
+            current_best_1["num_buckets"],
+        }
+        for seed in edge_seeds:
+            if seed <= min_reasonable + 1:
+                for nb in range(min_reasonable, min(min_reasonable + 5, max_reasonable + 1)):
+                    _eval_bucket_count(nb)
+            if seed >= max_reasonable - 1:
+                for nb in range(max(min_reasonable, max_reasonable - 4), max_reasonable + 1):
+                    _eval_bucket_count(nb)
+
+    all_results = [evaluated[k] for k in sorted(evaluated.keys())]
+
+    # Prefer higher target metric first, then stronger secondary target,
+    # then balanced accuracy as tie-breaker.
+    best_for_0pct = max(
+        all_results,
+        key=lambda r: (
+            r["metrics"]["tpr_0pct"],
+            r["metrics"]["tpr_01pct"],
+            r["metrics"]["tpr_1pct"],
+            r["metrics"]["bal_acc"],
+        ),
+    )
+    best_for_001pct = max(
+        all_results,
+        key=lambda r: (
+            r["metrics"]["tpr_01pct"],
+            r["metrics"]["tpr_1pct"],
+            r["metrics"]["tpr_0pct"],
+            r["metrics"]["bal_acc"],
+        ),
+    )
+    best_for_1pct = max(
+        all_results,
+        key=lambda r: (
+            r["metrics"]["tpr_1pct"],
+            r["metrics"]["tpr_01pct"],
+            r["metrics"]["tpr_0pct"],
+            r["metrics"]["bal_acc"],
+        ),
+    )
+
+    return all_results, best_for_0pct, best_for_001pct, best_for_1pct
 
 
 # ---------------------------------------------------------------------------
@@ -670,10 +949,20 @@ def _parse_args():
                         help="Experiment directory (e.g. outputs/<exp>/cifar10)")
     parser.add_argument("--num_buckets", type=int, default=10,
                         help="Number of quantile buckets (default: 5 = quintiles)")
+    parser.add_argument("--min_gmm_buckets", type=int, default=4,
+                        help="Minimum bucket count for adaptive GMM search")
+    parser.add_argument("--max_gmm_buckets", type=int, default=20,
+                        help="Maximum bucket count for adaptive GMM search")
     return parser.parse_args()
 
 
-def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
+def run(
+    exp_dir: str,
+    dataset: str = "cifar10",
+    num_buckets: int = 5,
+    min_gmm_buckets: int = 4,
+    max_gmm_buckets: int = 20,
+) -> None:
     config_dir = "config"
     yaml_path  = os.path.join(config_dir, f"{dataset}.yaml")
     yml_path   = os.path.join(config_dir, f"{dataset}.yml")
@@ -690,18 +979,22 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
     # 1. Query-set metadata — single source of truth for N and ground truth
     # ------------------------------------------------------------------
     print("\nLoading query metadata...")
-    query_pool_indices, ground_truth = _load_query_metadata(exp_dir)
-    n_query  = len(query_pool_indices)
+    query_global_indices, ground_truth = _load_query_metadata(exp_dir)
+    n_query  = len(query_global_indices)
     members  = int(ground_truth.sum())
     nonmembers = int((ground_truth == 0).sum())
     print(f"  n_query={n_query}  members={members}  non-members={nonmembers}")
+    _assert_query_has_in_out_shadow_coverage(cfg, query_global_indices)
 
     # ------------------------------------------------------------------
     # 2. Shadow artifacts — all must have shape (n_query,)
     # ------------------------------------------------------------------
     print(f"\nLoading {n_shadow_models} shadow models from {exp_dir}/shadows/...")
     lira_stats, C_lira_list, C_loss_list = _load_shadow_data(
-        exp_dir, n_shadow_models, n_query=n_query
+        exp_dir,
+        n_shadow_models,
+        n_query=n_query,
+        query_global_indices=query_global_indices,
     )
     K = len(lira_stats)
     print(f"  Loaded {K} shadows successfully.")
@@ -714,7 +1007,7 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
     # 3. Target model scores on D_query
     # ------------------------------------------------------------------
     print("\nEvaluating target model on query set...")
-    target_scores = _compute_target_lira_scores(exp_dir, cfg, query_pool_indices)
+    target_scores = _compute_target_lira_scores(exp_dir, cfg, query_global_indices)
     print(f"  target_scores: mean={target_scores.mean():.3f}, std={target_scores.std():.3f}")
 
     # ------------------------------------------------------------------
@@ -729,7 +1022,7 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
     tpr_1pct_all  = _tpr_at_fpr(fpr_all, tpr_all, max_fpr=0.01)
     bal_acc_all   = _balanced_accuracy_from_roc(fpr_all, tpr_all)
     print(f"  MIA global: TPR@0%FPR={tpr_0pct_all*100:.2f}%, "
-          f"TPR@0.1%FPR={tpr_01pct_all*100:.2f}%, "
+            f"TPR@0.1%FPR={tpr_01pct_all*100:.2f}%, "
           f"TPR@1%FPR={tpr_1pct_all*100:.2f}%, Balanced Acc={bal_acc_all*100:.2f}%")
 
     # ------------------------------------------------------------------
@@ -750,37 +1043,87 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
     _plot_bucket_tpr_comparison(scores_dict, mia_scores, ground_truth, out_dir, num_buckets)
 
     # ------------------------------------------------------------------
-    # 6. Bucket-wise GMM aggregation → global MIA
+    # 6. Adaptive bucket-wise GMM aggregation → global MIA
     # ------------------------------------------------------------------
-    gmm_bucket_scores = scores_C_loss if scores_C_loss is not None else scores_C_lira
-    gmm_bucket_name = "C_loss" if scores_C_loss is not None else "C_lira"
+    print("\nRunning adaptive GMM bucket search...")
     if scores_C_loss is None:
-        print("\nC_loss not available for all shadows; falling back to C_lira for GMM buckets.")
-    print(f"\nRunning bucket-wise GMM aggregation ({gmm_bucket_name} buckets)...")
-    gmm_probs = _gmm_aggregate_mia_scores(gmm_bucket_scores, mia_scores, num_buckets)
+        raise RuntimeError(
+            "C_loss is required for GMM bucketing but was not found in shadow artifacts. "
+            "Re-run influence computation to produce C_loss.npy for all shadows."
+        )
 
-    fpr_gmm, tpr_gmm, _ = roc_curve(ground_truth.astype(int), gmm_probs)
-    tpr_0pct_gmm  = _tpr_at_fpr(fpr_gmm, tpr_gmm, max_fpr=0.0)
-    tpr_01pct_gmm = _tpr_at_fpr(fpr_gmm, tpr_gmm, max_fpr=0.001)
-    tpr_1pct_gmm  = _tpr_at_fpr(fpr_gmm, tpr_gmm, max_fpr=0.01)
-    bal_acc_gmm   = _balanced_accuracy_from_roc(fpr_gmm, tpr_gmm)
-    print(f"  GMM-aggregated MIA: TPR@0%FPR={tpr_0pct_gmm*100:.2f}%, "
-          f"TPR@0.1%FPR={tpr_01pct_gmm*100:.2f}%, "
-          f"TPR@1%FPR={tpr_1pct_gmm*100:.2f}%, "
-          f"Balanced Acc={bal_acc_gmm*100:.2f}%")
+    _all_gmm_results, best_0pct, best_001pct, best_1pct = _adaptive_gmm_bucket_search(
+        ground_truth=ground_truth,
+        mia_scores=mia_scores,
+        influence_scores=scores_C_loss,
+        min_buckets=min_gmm_buckets,
+        max_buckets=max_gmm_buckets,
+    )
 
-    _plot_gmm_bucket_components(gmm_bucket_scores, mia_scores, ground_truth, out_dir, num_buckets)
+    print(f"  Evaluated {len(_all_gmm_results)} bucket counts via staged search.")
+    evaluated_bucket_counts = [int(r["num_buckets"]) for r in _all_gmm_results]
+    print(f"  Evaluated bucket counts: {evaluated_bucket_counts}")
+    print("  Per-count staged-search metrics:")
+    for res in _all_gmm_results:
+        m = res["metrics"]
+        print(
+            f"    buckets={int(res['num_buckets']):2d}  "
+            f"TPR@0%FPR={m['tpr_0pct']*100:6.2f}%  "
+            f"TPR@0.1%FPR={m['tpr_01pct']*100:6.2f}%  "
+            f"TPR@1%FPR={m['tpr_1pct']*100:6.2f}%  "
+            f"Balanced Acc={m['bal_acc']*100:6.2f}%"
+        )
+
+    print(
+        "  Best loss-bucketing for FPR=0%: "
+        f"buckets={best_0pct['num_buckets']}  "
+        f"TPR@0%FPR={best_0pct['metrics']['tpr_0pct']*100:.2f}%  "
+        f"TPR@0.1%FPR={best_0pct['metrics']['tpr_01pct']*100:.2f}%"
+    )
+    print(
+        "  Best loss-bucketing for FPR=0.1%: "
+        f"buckets={best_001pct['num_buckets']}  "
+        f"TPR@0%FPR={best_001pct['metrics']['tpr_0pct']*100:.2f}%  "
+        f"TPR@0.1%FPR={best_001pct['metrics']['tpr_01pct']*100:.2f}%"
+    )
+    print(
+        "  Best loss-bucketing for FPR=1%: "
+        f"buckets={best_1pct['num_buckets']}  "
+        f"TPR@1%FPR={best_1pct['metrics']['tpr_1pct']*100:.2f}%"
+    )
+
+    gmm_probs_0pct = best_0pct["gmm_probs"]
+    gmm_probs_001pct = best_001pct["gmm_probs"]
+
+    _plot_gmm_bucket_components(
+        scores_C_loss,
+        mia_scores,
+        ground_truth,
+        out_dir,
+        best_0pct["num_buckets"],
+    )
 
     # ------------------------------------------------------------------
     # 7. Save analysis outputs
     # ------------------------------------------------------------------
     save_dict = dict(
         mia_scores=mia_scores,
-        gmm_probs=gmm_probs,
+        gmm_probs_best_fpr0=gmm_probs_0pct,
+        gmm_probs_best_fpr01=gmm_probs_001pct,
         ground_truth=ground_truth,
         scores_C_lira=scores_C_lira,
-        query_pool_indices=query_pool_indices,
+        query_global_indices=query_global_indices,
+        best_gmm_fpr0_score=np.array("C_loss"),
+        best_gmm_fpr0_buckets=np.array(best_0pct["num_buckets"], dtype=np.int64),
+        best_gmm_fpr01_score=np.array("C_loss"),
+        best_gmm_fpr01_buckets=np.array(best_001pct["num_buckets"], dtype=np.int64),
+        best_gmm_fpr1_score=np.array("C_loss"),
+        best_gmm_fpr1_buckets=np.array(best_1pct["num_buckets"], dtype=np.int64),
     )
+    # Legacy aliases kept for backward compatibility with old readers.
+    save_dict["gmm_probs_best_fpr001"] = gmm_probs_001pct
+    save_dict["best_gmm_fpr001_score"] = np.array("C_loss")
+    save_dict["best_gmm_fpr001_buckets"] = np.array(best_001pct["num_buckets"], dtype=np.int64)
     if scores_C_loss is not None:
         save_dict["scores_C_loss"] = scores_C_loss
 
@@ -791,20 +1134,38 @@ def run(exp_dir: str, dataset: str = "cifar10", num_buckets: int = 5) -> None:
     print(f"\n{'='*60}")
     print("RESULTS")
     print(f"{'='*60}")
-    print(f"  MIA (raw):         TPR@0%FPR={tpr_0pct_all*100:.2f}%  "
-          f"TPR@0.1%FPR={tpr_01pct_all*100:.2f}%  "
-          f"TPR@1%FPR={tpr_1pct_all*100:.2f}%  "
-          f"Balanced Acc={bal_acc_all*100:.2f}%")
-    print(f"  MIA (GMM-bucketed):TPR@0%FPR={tpr_0pct_gmm*100:.2f}%  "
-          f"TPR@0.1%FPR={tpr_01pct_gmm*100:.2f}%  "
-          f"TPR@1%FPR={tpr_1pct_gmm*100:.2f}%  "
-          f"Balanced Acc={bal_acc_gmm*100:.2f}%")
+    print(
+        f"  MIA (raw):         TPR@0%FPR={tpr_0pct_all*100:.2f}%  "
+        f"TPR@0.1%FPR={tpr_01pct_all*100:.2f}%  "
+        f"TPR@1%FPR={tpr_1pct_all*100:.2f}%  "
+        f"Balanced Acc={bal_acc_all*100:.2f}%"
+    )
+    print(
+        f"  GMM best@FPR0:     score=C_loss  buckets={best_0pct['num_buckets']}  "
+        f"TPR@0%FPR={best_0pct['metrics']['tpr_0pct']*100:.2f}%  "
+        f"TPR@0.1%FPR={best_0pct['metrics']['tpr_01pct']*100:.2f}%  "
+        f"TPR@1%FPR={best_0pct['metrics']['tpr_1pct']*100:.2f}%  "
+        f"Balanced Acc={best_0pct['metrics']['bal_acc']*100:.2f}%"
+    )
+    print(
+        f"  GMM best@FPR0.1:   score=C_loss  buckets={best_001pct['num_buckets']}  "
+        f"TPR@0%FPR={best_001pct['metrics']['tpr_0pct']*100:.2f}%  "
+        f"TPR@0.1%FPR={best_001pct['metrics']['tpr_01pct']*100:.2f}%  "
+        f"TPR@1%FPR={best_001pct['metrics']['tpr_1pct']*100:.2f}%  "
+        f"Balanced Acc={best_001pct['metrics']['bal_acc']*100:.2f}%"
+    )
     print(f"{'='*60}\n")
 
 
 def main():
     cli = _parse_args()
-    run(exp_dir=cli.exp_dir, dataset=cli.dataset, num_buckets=cli.num_buckets)
+    run(
+        exp_dir=cli.exp_dir,
+        dataset=cli.dataset,
+        num_buckets=cli.num_buckets,
+        min_gmm_buckets=cli.min_gmm_buckets,
+        max_gmm_buckets=cli.max_gmm_buckets,
+    )
 
 
 if __name__ == "__main__":

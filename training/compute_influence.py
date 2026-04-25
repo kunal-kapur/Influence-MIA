@@ -1,6 +1,8 @@
 """Compute influence matrices and LiRA statistics for a trained shadow model.
 
 All per-point outputs are aligned to query_indices.npy (written by train_target).
+query_indices.npy stores global indices over CIFAR-10 train+test concat, but
+all query points are required to lie inside the shared target/shadow pool D.
 Index i in every saved array refers to query point query_indices[i].
 
 Outputs (per shadow_id)
@@ -13,6 +15,7 @@ shadows/{shadow_id}/lira_stats.npy  — scaled logits            (n_query,)
 
 import gc
 import os
+import warnings
 
 import numpy as np
 import torch
@@ -21,7 +24,7 @@ import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import ConcatDataset, DataLoader, Subset
 
-from data.loader import get_dataset, offline_data_split
+from data.loader import get_dataset, split_dataset_for_type
 from models.resnet import ResNet18_Influence
 from utils.io import load_model, load_array, save_array
 
@@ -31,7 +34,7 @@ from utils.io import load_model, load_array, save_array
 # ---------------------------------------------------------------------------
 
 def _load_query_indices(exp_dir: str) -> np.ndarray:
-    """Pool-relative indices of the query set, shape (n_query,)."""
+    """Global dataset indices of the query set, shape (n_query,)."""
     path = os.path.join(exp_dir, "query_indices.npy")
     if not os.path.exists(path):
         raise FileNotFoundError(
@@ -42,11 +45,7 @@ def _load_query_indices(exp_dir: str) -> np.ndarray:
 
 
 def _build_target_pool_no_aug(args):
-    """Load the target pool (D) with normalisation only — no augmentation.
-
-    Must use data_type='target' so that pool-relative indices in
-    query_indices.npy resolve to the correct samples.
-    """
+    """Load the shared target/shadow pool (D) with normalisation only."""
     get_dataset(args)
     mean = args.data_mean
     std  = args.data_std
@@ -61,11 +60,35 @@ def _build_target_pool_no_aug(args):
     test_ds = torchvision.datasets.CIFAR10(
         root=args.data_dir, train=False, download=True, transform=transform,
     )
-    return offline_data_split(ConcatDataset([train_ds, test_ds]), args.seed, "target")
+    return split_dataset_for_type(
+        ConcatDataset([train_ds, test_ds]),
+        seed=args.seed,
+        data_type="target",
+        shared_pool_size=getattr(args, "shared_pool_size", None),
+    )
+
+
+def _build_full_eval_dataset_no_aug(args):
+    """Load full CIFAR-10 train+test with normalisation only."""
+    get_dataset(args)
+    mean = args.data_mean
+    std = args.data_std
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+    ])
+    train_ds = torchvision.datasets.CIFAR10(
+        root=args.data_dir, train=True, download=True, transform=transform,
+    )
+    test_ds = torchvision.datasets.CIFAR10(
+        root=args.data_dir, train=False, download=True, transform=transform,
+    )
+    return ConcatDataset([train_ds, test_ds])
 
 
 def _build_shadow_pool_no_aug(args):
-    """Load the shadow pool with normalisation only.
+    """Load the shared target/shadow pool with normalisation only.
 
     Used to reconstruct the shadow model's actual training subset for the
     Hessian computation — we must use the same pool the model trained on.
@@ -84,7 +107,12 @@ def _build_shadow_pool_no_aug(args):
     test_ds = torchvision.datasets.CIFAR10(
         root=args.data_dir, train=False, download=True, transform=transform,
     )
-    return offline_data_split(ConcatDataset([train_ds, test_ds]), args.seed, "shadow")
+    return split_dataset_for_type(
+        ConcatDataset([train_ds, test_ds]),
+        seed=args.seed,
+        data_type="target",
+        shared_pool_size=getattr(args, "shared_pool_size", None),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -133,8 +161,54 @@ def _compute_last_layer_hessian(model, loader, device, damping=1e-4):
             N += bs
 
     H /= N
-    H += damping * torch.eye(D, device=device, dtype=torch.float32)
-    return torch.linalg.inv(H)
+    # Keep Hessian numerically symmetric before inversion.
+    H = 0.5 * (H + H.T)
+
+    eye = torch.eye(D, device=device, dtype=torch.float32)
+    damping_candidates = [float(damping), float(damping) * 10.0, float(damping) * 100.0]
+
+    for damp in damping_candidates:
+        H_damped = H + damp * eye
+        try:
+            # Prefer Cholesky inverse for SPD matrices (more stable than raw inv).
+            chol = torch.linalg.cholesky(H_damped)
+            H_inv = torch.cholesky_inverse(chol)
+            if not torch.isfinite(H_inv).all():
+                raise RuntimeError("H_inv contains non-finite values")
+            if damp != float(damping):
+                warnings.warn(
+                    f"Hessian inversion required stronger damping={damp:.1e} "
+                    f"(requested {float(damping):.1e})."
+                )
+            return H_inv
+        except RuntimeError:
+            continue
+
+    # Last-resort fallback: heavily damped pseudo-inverse.
+    fallback_damp = float(damping) * 1000.0
+    warnings.warn(
+        f"Falling back to pseudo-inverse with damping={fallback_damp:.1e}. "
+        "Results may be less reliable; consider increasing Hessian sample size."
+    )
+    H_fallback = H + fallback_damp * eye
+    return torch.linalg.pinv(H_fallback)
+
+
+def _artifacts_match_query_alignment(meta_path, query_indices, train_dataset_size):
+    """Check whether cached influence artifacts match current query alignment."""
+    if not os.path.exists(meta_path):
+        return False
+    try:
+        meta = np.load(meta_path)
+        cached_q = meta["query_indices"].astype(np.int64)
+        cached_train_size = int(meta["train_dataset_size"])
+        return (
+            cached_train_size == int(train_dataset_size)
+            and cached_q.shape == query_indices.shape
+            and np.array_equal(cached_q, query_indices)
+        )
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +306,7 @@ def compute_influence(args, shadow_id, device):
     clira_path = os.path.join(out_dir, "C_lira.npy")
     closs_path = os.path.join(out_dir, "C_loss.npy")
     lira_path  = os.path.join(out_dir, "lira_stats.npy")
+    meta_path  = os.path.join(out_dir, "influence_meta.npz")
 
     # ------------------------------------------------------------------
     # 1. Query indices — defines the N points all outputs are aligned to
@@ -242,26 +317,27 @@ def compute_influence(args, shadow_id, device):
     print(f"[shadow {shadow_id}] Query set size: n_query={n_query}")
 
     # ------------------------------------------------------------------
-    # 2. Target pool (no aug) — for evaluating the shadow model on D_query
+    # 2. Full eval dataset (no aug) — for evaluating the shadow model on D_query
     # ------------------------------------------------------------------
-    target_pool_no_aug = _build_target_pool_no_aug(args)
+    full_eval_no_aug = _build_full_eval_dataset_no_aug(args)
 
-    # Verify pool size matches what query_indices was built against
-    assert len(target_pool_no_aug) >= query_pool_indices.max() + 1, (
-        f"[shadow {shadow_id}] target pool size {len(target_pool_no_aug)} is smaller than "
+    # Verify full dataset size matches what query_indices was built against
+    assert len(full_eval_no_aug) >= query_pool_indices.max() + 1, (
+        f"[shadow {shadow_id}] full eval dataset size {len(full_eval_no_aug)} is smaller than "
         f"max query index {query_pool_indices.max()}. Seed or dataset changed."
     )
 
     # Subset to exactly the query points, in query_indices order
-    query_ds = Subset(target_pool_no_aug, query_pool_indices.tolist())
+    query_ds = Subset(full_eval_no_aug, query_pool_indices.tolist())
     assert len(query_ds) == n_query
 
     query_loader = DataLoader(
         query_ds,
         batch_size=args.batch_size,
         shuffle=False,          # must stay False — order defines the index space
+        drop_last=False,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=(device.type == "cuda"),
     )
 
     # ------------------------------------------------------------------
@@ -269,6 +345,17 @@ def compute_influence(args, shadow_id, device):
     # ------------------------------------------------------------------
     shadow_pool_no_aug  = _build_shadow_pool_no_aug(args)
     shadow_pool_size    = len(shadow_pool_no_aug)
+    shadow_pool_global_indices = np.asarray(shadow_pool_no_aug.indices, dtype=np.int64)
+
+    outside_shadow_pool = np.setdiff1d(
+        query_pool_indices,
+        shadow_pool_global_indices,
+        assume_unique=False,
+    )
+    assert len(outside_shadow_pool) == 0, (
+        f"[shadow {shadow_id}] query set contains {len(outside_shadow_pool)} points outside "
+        "the shared pool D. Query non-members must be drawn from D\\D_train."
+    )
 
     # Reconstruct the same shadow training subset used in train_shadow
     np.random.seed(2025 + shadow_id)
@@ -276,7 +363,32 @@ def compute_influence(args, shadow_id, device):
         shadow_pool_size, int(args.pkeep * shadow_pool_size), replace=False
     )
     train_dataset_size = len(shadow_in_indices)
+
+    shadow_in_global = shadow_pool_global_indices[shadow_in_indices]
+    query_in_shadow_mask = np.isin(query_pool_indices, shadow_in_global)
+    num_query_in_shadow = int(query_in_shadow_mask.sum())
+    num_query_out_shadow = int(n_query - num_query_in_shadow)
+    print(
+        f"[shadow {shadow_id}] Query coverage in this shadow: "
+        f"IN={num_query_in_shadow}, OUT={num_query_out_shadow}"
+    )
+    assert num_query_in_shadow > 0 and num_query_out_shadow > 0, (
+        f"[shadow {shadow_id}] degenerate IN/OUT split over query set: "
+        f"IN={num_query_in_shadow}, OUT={num_query_out_shadow}."
+    )
+
     print(f"[shadow {shadow_id}] Shadow training subset size: {train_dataset_size}")
+
+    # If query ordering or train subset size changed, force recomputation of
+    # query-aligned artifacts to prevent silent index drift.
+    has_valid_alignment_meta = _artifacts_match_query_alignment(
+        meta_path, query_pool_indices, train_dataset_size
+    )
+    if not has_valid_alignment_meta:
+        for p in (clira_path, closs_path, lira_path):
+            if os.path.exists(p):
+                os.remove(p)
+                print(f"[shadow {shadow_id}] Removed stale artifact: {p}")
 
     # ------------------------------------------------------------------
     # 5. Load shadow model
@@ -292,7 +404,7 @@ def compute_influence(args, shadow_id, device):
     # ------------------------------------------------------------------
     expected_D = (model.linear.in_features + 1) * model.linear.out_features
     H_inv = None
-    if os.path.exists(hinv_path):
+    if os.path.exists(hinv_path) and has_valid_alignment_meta:
         cached = load_array(hinv_path)
         if cached.shape == (expected_D, expected_D):
             print(f"[shadow {shadow_id}] H_inv loaded from cache")
@@ -300,6 +412,11 @@ def compute_influence(args, shadow_id, device):
         else:
             print(f"[shadow {shadow_id}] H_inv shape {cached.shape} != expected "
                   f"({expected_D},{expected_D}) — recomputing.")
+    elif os.path.exists(hinv_path) and not has_valid_alignment_meta:
+        print(
+            f"[shadow {shadow_id}] Recomputing H_inv because alignment metadata is "
+            "missing or stale."
+        )
 
     if H_inv is None:
         hessian_sample = min(3000, train_dataset_size)
@@ -310,8 +427,9 @@ def compute_influence(args, shadow_id, device):
             Subset(shadow_pool_no_aug, hessian_indices),
             batch_size=args.batch_size,
             shuffle=False,
+            drop_last=False,
             num_workers=args.num_workers,
-            pin_memory=True,
+            pin_memory=(device.type == "cuda"),
         )
         print(f"[shadow {shadow_id}] Computing Hessian on {hessian_sample} shadow-IN samples...")
         H_inv = _compute_last_layer_hessian(model, hessian_loader, device, damping=1e-4)
@@ -353,6 +471,13 @@ def compute_influence(args, shadow_id, device):
         )
         save_array(lira_stats, lira_path)
         print(f"[shadow {shadow_id}] lira_stats saved  shape={lira_stats.shape}")
+
+    np.savez_compressed(
+        meta_path,
+        query_indices=query_pool_indices.astype(np.int64),
+        train_dataset_size=np.array(train_dataset_size, dtype=np.int64),
+    )
+    print(f"[shadow {shadow_id}] alignment metadata saved: {meta_path}")
 
     del model
     gc.collect()
