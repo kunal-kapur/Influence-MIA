@@ -138,20 +138,36 @@ def fit_fixed_zero_rightshift_mixture(
         reliable = False
         reason   = f"variance degenerate (var_out={var_out:.4f}, var_in={var_in:.4f})"
 
+    # Log-likelihood ratio: log p(x|IN) - log p(x|OUT), the Neyman-Pearson
+    # optimal test statistic.  Scale-comparable across buckets with different
+    # variances, so concatenating LLRs from all buckets gives a valid global
+    # ranking without the 0.5-flooding that afflicts raw posteriors.
+    log_p_in_density  = norm.logpdf(x, mu_in, np.sqrt(var_in))
+    log_p_out_density = norm.logpdf(x,   0.0, np.sqrt(var_out))
+    llr = log_p_in_density - log_p_out_density
+
+    # Bhattacharyya distance — quantifies genuine separation between components.
+    # Values < 0.1 indicate no real signal in this bucket.
+    bc_term1 = 0.25 * (mu_in ** 2) / (var_in + var_out)
+    bc_term2 = 0.5 * np.log((var_in + var_out) / (2.0 * np.sqrt(var_in * var_out)))
+    bhattacharyya = bc_term1 + bc_term2
+
     return {
-        "pi_out":       pi_out,
-        "pi_in":        pi_in,
-        "mu_out":       0.0,
-        "mu_in":        mu_in,
-        "var_out":      var_out,
-        "var_in":       var_in,
-        "posterior_in":  r_in,
-        "posterior_out": r_out,
-        "loglik":       loglik,
-        "converged":    converged,
-        "reliable":     reliable,
-        "reason":       reason,
-        "threshold":    threshold,
+        "pi_out":         pi_out,
+        "pi_in":          pi_in,
+        "mu_out":         0.0,
+        "mu_in":          mu_in,
+        "var_out":        var_out,
+        "var_in":         var_in,
+        "posterior_in":   r_in,
+        "posterior_out":  r_out,
+        "llr":            llr,
+        "bhattacharyya":  bhattacharyya,
+        "loglik":         loglik,
+        "converged":      converged,
+        "reliable":       reliable,
+        "reason":         reason,
+        "threshold":      threshold,
     }
 
 
@@ -439,14 +455,25 @@ def _gmm_aggregate_mia_scores(
     num_buckets: int = 10,
     verbose: bool = True,
 ) -> np.ndarray:
-    """Bucket-wise constrained-mixture aggregation of MIA scores.
+    """Bucket-wise GMM aggregation using Log-Likelihood Ratios (LLR).
 
-    Uses fit_fixed_zero_rightshift_mixture per bucket.  If the fit is not
-    reliable, falls back to 0.5 (uncertain).  Buckets too small (< 10) fall
-    back to rank-normalised raw scores.
+    Returns a global LLR array that is comparable across all buckets:
+
+        LLR(x) = log p(s(x) | IN, bucket_b) - log p(s(x) | OUT, bucket_b)
+
+    By the Neyman-Pearson lemma this is the most powerful test statistic under
+    the GMM model.  It is scale-comparable across buckets regardless of their
+    variances, which eliminates the 0.5-flooding artefact of raw posteriors.
+
+    Unreliable buckets (flat GMMs, poor separation) produce LLR ≈ 0 so those
+    points settle near the middle of the global ranking — they do not flood the
+    low-FPR regime with false positives.
+
+    Buckets too small (< 10 points) fall back to centred rank scores so they
+    also contribute LLR-like values near 0 rather than random posteriors.
     """
     N = len(mia_scores)
-    gmm_probs = np.full(N, np.nan)
+    llr_scores = np.zeros(N, dtype=float)  # default 0 = uninformative
 
     quantiles  = np.quantile(influence_scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
     bucket_ids = np.digitize(influence_scores, quantiles)
@@ -454,8 +481,10 @@ def _gmm_aggregate_mia_scores(
     for b in range(num_buckets):
         idx = np.where(bucket_ids == b)[0]
         if len(idx) < 10:
+            # Too few points: centre ranks around 0 so they rank near the middle.
             ranks = np.argsort(np.argsort(mia_scores[idx])).astype(float)
-            gmm_probs[idx] = ranks / max(len(idx) - 1, 1)
+            centred = ranks - (len(idx) - 1) / 2.0
+            llr_scores[idx] = centred / max((len(idx) - 1) / 2.0, 1.0)
             continue
 
         fit = fit_fixed_zero_rightshift_mixture(mia_scores[idx])
@@ -466,17 +495,18 @@ def _gmm_aggregate_mia_scores(
                 f"sd_out={np.sqrt(fit['var_out']):.3f}  "
                 f"sd_in={np.sqrt(fit['var_in']):.3f}  "
                 f"pi_in={fit['pi_in']:.3f}  "
+                f"bhattacharyya={fit['bhattacharyya']:.3f}  "
                 f"reliable={fit['reliable']}  "
                 f"converged={fit['converged']}"
             )
         if not fit["reliable"]:
             if verbose:
-                print(f"    -> unreliable: {fit['reason']} — defaulting to p_in=0.5")
-            gmm_probs[idx] = 0.5
+                print(f"    -> unreliable: {fit['reason']} — LLR set to 0 (uninformative)")
+            # LLR already 0 for these indices; leave as-is.
         else:
-            gmm_probs[idx] = fit["posterior_in"]
+            llr_scores[idx] = fit["llr"]
 
-    return gmm_probs
+    return llr_scores
 
 
 def _evaluate_attack_metrics(ground_truth: np.ndarray, scores: np.ndarray) -> dict:
@@ -790,11 +820,32 @@ def _plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, out_
                 f"sd_out={np.sqrt(fit['var_out']):.3f}  "
                 f"sd_in={np.sqrt(fit['var_in']):.3f}  "
                 f"pi_in={fit['pi_in']:.3f}  "
+                f"bhattacharyya={fit['bhattacharyya']:.3f}  "
                 f"threshold={thr_str}  "
                 f"reliable={fit['reliable']}  converged={fit['converged']}"
             )
             if not fit["reliable"]:
                 print(f"    -> unreliable: {fit['reason']}")
+
+            # Permutation test: shuffle IN/OUT labels and recompute AUC to
+            # confirm that the real bucket AUC is genuinely above chance.
+            if len(bucket_members) >= 4 and bucket_members.sum() >= 2 and (~bucket_members).sum() >= 2:
+                from sklearn.metrics import roc_auc_score
+                try:
+                    real_auc = roc_auc_score(bucket_members.astype(int), fit["llr"])
+                    rng_perm = np.random.RandomState(42)
+                    perm_aucs = []
+                    for _ in range(200):
+                        shuffled = rng_perm.permutation(bucket_members.astype(int))
+                        perm_aucs.append(roc_auc_score(shuffled, fit["llr"]))
+                    perm_p = float(np.mean(np.array(perm_aucs) >= real_auc))
+                    print(
+                        f"    -> permutation test: real AUC={real_auc:.3f}  "
+                        f"perm mean={np.mean(perm_aucs):.3f}  p={perm_p:.3f}"
+                        + ("  [NO SIGNAL]" if perm_p > 0.1 else "")
+                    )
+                except Exception:
+                    pass
 
             pdf_out   = fit["pi_out"] * norm.pdf(x_grid, 0.0, np.sqrt(fit["var_out"]))
             pdf_in    = fit["pi_in"]  * norm.pdf(x_grid, fit["mu_in"], np.sqrt(fit["var_in"]))
@@ -802,6 +853,7 @@ def _plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, out_
 
             p_in  = fit["posterior_in"]
             p_out = fit["posterior_out"]
+            llr_vals = fit["llr"]
         else:
             fit       = None
             total_pdf = None
@@ -809,12 +861,13 @@ def _plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, out_
             pdf_in    = None
             p_in  = np.full(len(idx), np.nan, dtype=float)
             p_out = np.full(len(idx), np.nan, dtype=float)
+            llr_vals = np.zeros(len(idx), dtype=float)
             if len(idx) > 0:
                 ranks = np.argsort(np.argsort(bucket_scores)).astype(float)
                 p_in  = ranks / max(len(idx) - 1, 1)
                 p_out = 1.0 - p_in
 
-        predicted_is_in = p_in >= 0.5
+        predicted_is_in = llr_vals > 0.0
 
         bins = np.linspace(score_min, score_max, 28)
         ax.hist(non_member_scores, bins=bins, density=True, alpha=0.45,
@@ -857,25 +910,28 @@ def _plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, out_
         fig.savefig(out_path, dpi=120)
         plt.close(fig)
 
-        mu_in_val   = float(fit["mu_in"])  if fit else float("nan")
-        pi_in_val   = float(fit["pi_in"])  if fit else float("nan")
-        reliable    = bool(fit["reliable"]) if fit else False
-        threshold   = fit["threshold"]     if fit else None
+        mu_in_val      = float(fit["mu_in"])           if fit else float("nan")
+        pi_in_val      = float(fit["pi_in"])           if fit else float("nan")
+        bhatta_val     = float(fit["bhattacharyya"])   if fit else float("nan")
+        reliable       = bool(fit["reliable"])         if fit else False
+        threshold      = fit["threshold"]              if fit else None
         for local_pos, point_idx in enumerate(idx):
             csv_rows.append({
-                "point_index":    int(point_idx),
-                "bucket":         int(b),
-                "bucket_size":    int(len(idx)),
-                "mu_in":          mu_in_val,
-                "pi_in":          pi_in_val,
-                "reliable":       reliable,
-                "threshold":      float(threshold) if threshold is not None else float("nan"),
-                "mia_score":      float(bucket_scores[local_pos]),
-                "ground_truth":   int(ground_truth[point_idx]),
+                "point_index":        int(point_idx),
+                "bucket":             int(b),
+                "bucket_size":        int(len(idx)),
+                "mu_in":              mu_in_val,
+                "pi_in":              pi_in_val,
+                "bhattacharyya":      bhatta_val,
+                "reliable":           reliable,
+                "threshold":          float(threshold) if threshold is not None else float("nan"),
+                "mia_score":          float(bucket_scores[local_pos]),
+                "llr":                float(llr_vals[local_pos]),
+                "ground_truth":       int(ground_truth[point_idx]),
                 "ground_truth_label": "in" if ground_truth[point_idx] == 1 else "out",
-                "predicted_label": "in" if bool(predicted_is_in[local_pos]) else "out",
-                "p_in":           float(p_in[local_pos]),
-                "p_out":          float(p_out[local_pos]),
+                "predicted_label":    "in" if bool(predicted_is_in[local_pos]) else "out",
+                "p_in":               float(p_in[local_pos]),
+                "p_out":              float(p_out[local_pos]),
             })
 
     csv_rows.sort(key=lambda row: (row["bucket"], row["mia_score"], row["point_index"]))
@@ -889,9 +945,11 @@ def _plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, out_
                 "bucket_size",
                 "mu_in",
                 "pi_in",
+                "bhattacharyya",
                 "reliable",
                 "threshold",
                 "mia_score",
+                "llr",
                 "ground_truth",
                 "ground_truth_label",
                 "predicted_label",
@@ -1026,6 +1084,32 @@ def run(
           f"TPR@1%FPR={tpr_1pct_all*100:.2f}%, Balanced Acc={bal_acc_all*100:.2f}%")
 
     # ------------------------------------------------------------------
+    # Outlier/variance hypothesis: check whether top-ranked IN members
+    # have anomalously high per-shadow score variance.  If the top-K
+    # IN members by raw MIA score are driven by lucky shadow variance
+    # outliers, their individual shadow scores will be highly dispersed.
+    # ------------------------------------------------------------------
+    shadow_matrix = np.stack(lira_stats, axis=0)  # (K, N)
+    per_point_var = shadow_matrix.var(axis=0)       # (N,)
+    top_k_check = min(20, int(ground_truth.sum()))
+    sorted_by_score = np.argsort(mia_scores)[::-1]
+    top_k_in_idx = [i for i in sorted_by_score if ground_truth[i] == 1][:top_k_check]
+    rest_in_idx  = [i for i in range(len(ground_truth)) if ground_truth[i] == 1 and i not in set(top_k_in_idx)]
+    if top_k_in_idx and rest_in_idx:
+        var_top = float(per_point_var[top_k_in_idx].mean())
+        var_rest = float(per_point_var[rest_in_idx].mean())
+        print(
+            f"  [Variance check] Top-{top_k_check} IN members: "
+            f"mean shadow var={var_top:.4f}  vs  rest of IN: mean shadow var={var_rest:.4f}"
+        )
+        if var_top > var_rest * 1.5:
+            print(
+                "    -> Top-ranked IN members have significantly higher shadow variance "
+                "(>1.5x rest). Outlier/noise hypothesis confirmed — "
+                "these high MIA scores are likely variance artefacts."
+            )
+
+    # ------------------------------------------------------------------
     # 5. Influence scores
     # ------------------------------------------------------------------
     print("\nAggregating influence scores across shadows...")
@@ -1095,6 +1179,24 @@ def run(
     gmm_probs_0pct = best_0pct["gmm_probs"]
     gmm_probs_001pct = best_001pct["gmm_probs"]
 
+    # ------------------------------------------------------------------
+    # Precision@K sanity check on the best LLR scores.
+    # If LLR aggregation is working correctly, IN members should be
+    # concentrated at the top of the global ranking.
+    # Precision ≈ base_rate means the GMM component labels are wrong
+    # or the LLR values are inverted.
+    # ------------------------------------------------------------------
+    base_rate = float(ground_truth.mean())
+    llr_best = best_0pct["gmm_probs"]  # now contains LLR values
+    sorted_by_llr = np.argsort(llr_best)[::-1]
+    sorted_labels = ground_truth[sorted_by_llr]
+    print("\n  [Precision@K sanity check] (base rate = {:.3f})".format(base_rate))
+    for k in [10, 50, 100]:
+        if k <= len(sorted_labels):
+            prec = float(sorted_labels[:k].mean())
+            flag = "  [OK]" if prec > base_rate * 1.5 else "  [WARNING: near base rate — check GMM component labels]"
+            print(f"    Precision@{k:3d} = {prec:.3f}{flag}")
+
     _plot_gmm_bucket_components(
         scores_C_loss,
         mia_scores,
@@ -1108,6 +1210,8 @@ def run(
     # ------------------------------------------------------------------
     save_dict = dict(
         mia_scores=mia_scores,
+        # gmm_probs_* keys now contain LLR values (not posteriors).
+        # LLR = log p(s|IN) - log p(s|OUT) per bucket GMM — scale-comparable globally.
         gmm_probs_best_fpr0=gmm_probs_0pct,
         gmm_probs_best_fpr01=gmm_probs_001pct,
         ground_truth=ground_truth,
@@ -1141,14 +1245,14 @@ def run(
         f"Balanced Acc={bal_acc_all*100:.2f}%"
     )
     print(
-        f"  GMM best@FPR0:     score=C_loss  buckets={best_0pct['num_buckets']}  "
+        f"  LLR-GMM best@FPR0:   score=C_loss  buckets={best_0pct['num_buckets']}  "
         f"TPR@0%FPR={best_0pct['metrics']['tpr_0pct']*100:.2f}%  "
         f"TPR@0.1%FPR={best_0pct['metrics']['tpr_01pct']*100:.2f}%  "
         f"TPR@1%FPR={best_0pct['metrics']['tpr_1pct']*100:.2f}%  "
         f"Balanced Acc={best_0pct['metrics']['bal_acc']*100:.2f}%"
     )
     print(
-        f"  GMM best@FPR0.1:   score=C_loss  buckets={best_001pct['num_buckets']}  "
+        f"  LLR-GMM best@FPR0.1: score=C_loss  buckets={best_001pct['num_buckets']}  "
         f"TPR@0%FPR={best_001pct['metrics']['tpr_0pct']*100:.2f}%  "
         f"TPR@0.1%FPR={best_001pct['metrics']['tpr_01pct']*100:.2f}%  "
         f"TPR@1%FPR={best_001pct['metrics']['tpr_1pct']*100:.2f}%  "
