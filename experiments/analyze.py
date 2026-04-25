@@ -8,14 +8,6 @@ For each query point we have, across K shadow models:
 The MIA attack score for point i (expected discrepancy) is:
     mia_score[i] = target_score[i] - mean_k(lira_stats[k][i])
 
-This directly measures how much more confident the target model is relative
-to the shadow models' baseline expectation, without requiring IN/OUT Gaussian
-fitting (which is invalid when shadow pools are disjoint from the query set).
-
-We bucket points by each influence score and compute:
-    - Pearson correlation with mia_score
-    - TPR @ 0% FPR, TPR @ 0.1% FPR, TPR @ 1% FPR, and Balanced Accuracy per bucket
-
 Usage
 -----
 python -m experiments.analyze --exp_dir outputs/<exp_name>/cifar10
@@ -23,950 +15,34 @@ python -m experiments.analyze --exp_dir outputs/<exp_name>/cifar10 --num_buckets
 """
 
 import argparse
-import csv
 import os
-import sys
-import types
-from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
-import torch
-import torchvision
-import torchvision.transforms as transforms
 import yaml
-from scipy.stats import norm
 from sklearn.metrics import roc_curve
-from torch.utils.data import ConcatDataset, DataLoader, Subset
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+from .data_utils import (
+    assert_query_has_in_out_shadow_coverage,
+    compute_target_lira_scores,
+    load_query_metadata,
+    load_shadow_data,
+)
+from .metrics import (
+    adaptive_gmm_bucket_search,
+    aggregate_influence,
+    balanced_accuracy_from_roc,
+    compute_mia_scores,
+    tpr_at_fpr,
+)
+from .plotting import (
+    plot_bucket_mia_hist,
+    plot_bucket_tpr_comparison,
+    plot_gmm_bucket_components,
+    plot_score_vs_mia,
+)
 
-from data.loader import split_dataset_for_type
-
-
-# ---------------------------------------------------------------------------
-# Constrained zero-mean / right-shifted 2-component mixture
-# ---------------------------------------------------------------------------
-
-def fit_fixed_zero_rightshift_mixture(
-    x,
-    max_iter=200,
-    tol=1e-6,
-    min_var=1e-4,
-    mu_in_min=0.5,
-    min_pi_in=0.02,
-    reliability_margin=0.25,
-):
-    """Fit a constrained 1D mixture:
-
-        p(x) = pi_out * N(x; 0, var_out) + pi_in * N(x; mu_in, var_in)
-
-    mu_out is fixed at 0.  mu_in is clamped to >= mu_in_min after each M-step.
-    Returns a dict with posteriors, parameters, convergence flag, reliability
-    flag, and the posterior-equality threshold.
-    """
-    x = np.asarray(x, dtype=float)
-    N = len(x)
-
-    # --- initialise ---
-    mu_in  = max(float(np.percentile(x, 75)), mu_in_min)
-    var_out = max(float(np.var(x)) * 0.5, min_var)
-    var_in  = max(float(np.var(x)) * 0.5, min_var)
-    pi_out  = 0.5
-    pi_in   = 0.5
-
-    prev_loglik = -np.inf
-    converged   = False
-
-    for _ in range(max_iter):
-        # E-step
-        log_p_out = np.log(pi_out + 1e-300) + norm.logpdf(x, 0.0, np.sqrt(var_out))
-        log_p_in  = np.log(pi_in  + 1e-300) + norm.logpdf(x, mu_in, np.sqrt(var_in))
-
-        log_sum = np.logaddexp(log_p_out, log_p_in)
-        r_out   = np.exp(log_p_out - log_sum)
-        r_in    = 1.0 - r_out
-
-        loglik = float(log_sum.sum())
-
-        # M-step
-        n_out = r_out.sum()
-        n_in  = r_in.sum()
-        total = n_out + n_in
-
-        pi_out = n_out / total
-        pi_in  = n_in  / total
-
-        # mu_out stays 0; update mu_in, clamp
-        mu_in_unconstrained = float(np.dot(r_in, x) / (n_in + 1e-300))
-        mu_in = max(mu_in_unconstrained, mu_in_min)
-
-        var_out = max(float(np.dot(r_out, x ** 2) / (n_out + 1e-300)), min_var)
-        var_in  = max(float(np.dot(r_in, (x - mu_in) ** 2) / (n_in + 1e-300)), min_var)
-
-        if abs(loglik - prev_loglik) < tol:
-            converged = True
-            break
-        prev_loglik = loglik
-
-    # --- posterior-equality threshold (pi_out*N(t;0,s_out) == pi_in*N(t;mu_in,s_in)) ---
-    # Solve analytically by scanning the grid (closed form is messy with unequal variances)
-    t_grid = np.linspace(0.0, mu_in * 2.5, 2000)
-    d_out  = pi_out * norm.pdf(t_grid, 0.0, np.sqrt(var_out))
-    d_in   = pi_in  * norm.pdf(t_grid, mu_in, np.sqrt(var_in))
-    sign_changes = np.where(np.diff(np.sign(d_in - d_out)))[0]
-    threshold = None
-    if len(sign_changes) > 0:
-        i = sign_changes[0]
-        # linear interpolation
-        f0 = (d_in - d_out)[i]
-        f1 = (d_in - d_out)[i + 1]
-        threshold = float(t_grid[i] - f0 * (t_grid[i + 1] - t_grid[i]) / (f1 - f0))
-
-    # --- reliability ---
-    reliable = True
-    reason   = "ok"
-    if mu_in <= mu_in_min + reliability_margin:
-        reliable = False
-        reason   = f"mu_in={mu_in:.3f} too close to mu_in_min={mu_in_min}"
-    elif pi_in < min_pi_in:
-        reliable = False
-        reason   = f"pi_in={pi_in:.3f} < min_pi_in={min_pi_in}"
-    elif var_out <= min_var * 2 or var_in <= min_var * 2:
-        reliable = False
-        reason   = f"variance degenerate (var_out={var_out:.4f}, var_in={var_in:.4f})"
-
-    # Log-likelihood ratio: log p(x|IN) - log p(x|OUT), the Neyman-Pearson
-    # optimal test statistic.  Scale-comparable across buckets with different
-    # variances, so concatenating LLRs from all buckets gives a valid global
-    # ranking without the 0.5-flooding that afflicts raw posteriors.
-    log_p_in_density  = norm.logpdf(x, mu_in, np.sqrt(var_in))
-    log_p_out_density = norm.logpdf(x,   0.0, np.sqrt(var_out))
-    llr = log_p_in_density - log_p_out_density
-
-    # Bhattacharyya distance — quantifies genuine separation between components.
-    # Values < 0.1 indicate no real signal in this bucket.
-    bc_term1 = 0.25 * (mu_in ** 2) / (var_in + var_out)
-    bc_term2 = 0.5 * np.log((var_in + var_out) / (2.0 * np.sqrt(var_in * var_out)))
-    bhattacharyya = bc_term1 + bc_term2
-
-    return {
-        "pi_out":         pi_out,
-        "pi_in":          pi_in,
-        "mu_out":         0.0,
-        "mu_in":          mu_in,
-        "var_out":        var_out,
-        "var_in":         var_in,
-        "posterior_in":   r_in,
-        "posterior_out":  r_out,
-        "llr":            llr,
-        "bhattacharyya":  bhattacharyya,
-        "loglik":         loglik,
-        "converged":      converged,
-        "reliable":       reliable,
-        "reason":         reason,
-        "threshold":      threshold,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Load all shadow artifacts
-# ---------------------------------------------------------------------------
-
-def _load_shadow_data(
-    exp_dir: str,
-    n_shadow_models: int,
-    n_query: int,
-    query_global_indices: np.ndarray,
-):
-    """Load per-shadow arrays aligned to query_indices.
-
-    Returns
-    -------
-    lira_stats : list of (n_query,) arrays  — shadow scaled logits
-    C_lira     : list of (n_query,) arrays
-    C_loss     : list of (n_query,) arrays  (None if file absent)
-    """
-    lira_stats, C_lira, C_loss = [], [], []
-    for k in range(n_shadow_models):
-        d          = os.path.join(exp_dir, "shadows", str(k))
-        lira_path  = os.path.join(d, "lira_stats.npy")
-        clira_path = os.path.join(d, "C_lira.npy")
-        closs_path = os.path.join(d, "C_loss.npy")
-        meta_path  = os.path.join(d, "influence_meta.npz")
-
-        if not os.path.exists(lira_path):
-            print(f"  [shadow {k}] lira_stats.npy missing — skipping.")
-            continue
-
-        ls = np.load(lira_path)
-        cl = np.load(clira_path)
-
-        assert ls.shape == (n_query,), (
-            f"[shadow {k}] lira_stats shape {ls.shape} != (n_query={n_query},). "
-            "Shadow was evaluated on a different query set — re-run compute_influence."
-        )
-        assert cl.shape == (n_query,), (
-            f"[shadow {k}] C_lira shape {cl.shape} != (n_query={n_query},). "
-            "Re-run compute_influence for this shadow."
-        )
-
-        if os.path.exists(meta_path):
-            meta = np.load(meta_path)
-            if "query_indices" in meta:
-                cached_q = meta["query_indices"].astype(np.int64)
-                assert cached_q.shape == query_global_indices.shape and np.array_equal(
-                    cached_q, query_global_indices
-                ), (
-                    f"[shadow {k}] influence_meta query_indices mismatch with current "
-                    "query_indices.npy. Re-run compute_influence for this shadow to fix "
-                    "gradient/index alignment."
-                )
-
-        lira_stats.append(ls)
-        C_lira.append(cl)
-        C_loss.append(np.load(closs_path) if os.path.exists(closs_path) else None)
-
-    return lira_stats, C_lira, C_loss
-
-
-# ---------------------------------------------------------------------------
-# Query-set metadata
-# ---------------------------------------------------------------------------
-
-def _load_query_metadata(exp_dir: str):
-    """Load query_indices.npy and ground_truth.npy written by train_target.
-
-    Returns
-    -------
-    query_global_indices : (n_query,) int64 — global index of each query point
-    ground_truth       : (n_query,) int32 — 1 = member, 0 = non-member
-    """
-    qi_path = os.path.join(exp_dir, "query_indices.npy")
-    gt_path = os.path.join(exp_dir, "ground_truth.npy")
-
-    if not os.path.exists(qi_path):
-        raise FileNotFoundError(
-            f"query_indices.npy not found at {qi_path}. "
-            "Run train_target.py first."
-        )
-    if not os.path.exists(gt_path):
-        raise FileNotFoundError(
-            f"ground_truth.npy not found at {gt_path}. "
-            "Run train_target.py first."
-        )
-
-    query_global_indices = np.load(qi_path).astype(np.int64)
-    ground_truth       = np.load(gt_path).astype(np.int32)
-
-    assert query_global_indices.shape == ground_truth.shape, (
-        f"query_indices shape {query_global_indices.shape} != "
-        f"ground_truth shape {ground_truth.shape}."
-    )
-    members    = int(ground_truth.sum())
-    nonmembers = int((ground_truth == 0).sum())
-    assert members == nonmembers, (
-        f"Query set is not balanced: {members} members vs {nonmembers} non-members."
-    )
-    return query_global_indices, ground_truth
-
-
-def _build_target_pool_global_indices(cfg: dict) -> np.ndarray:
-    """Reconstruct shared pool D global indices exactly as in training."""
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(cfg["data_mean"], cfg["data_std"]),
-    ])
-    train_ds = torchvision.datasets.CIFAR10(
-        root=cfg["data_dir"], train=True, download=False, transform=transform
-    )
-    test_ds = torchvision.datasets.CIFAR10(
-        root=cfg["data_dir"], train=False, download=False, transform=transform
-    )
-    target_pool = split_dataset_for_type(
-        ConcatDataset([train_ds, test_ds]),
-        seed=cfg["seed"],
-        data_type="target",
-        shared_pool_size=cfg.get("shared_pool_size"),
-    )
-    return np.asarray(target_pool.indices, dtype=np.int64)
-
-
-def _assert_query_has_in_out_shadow_coverage(cfg: dict, query_global_indices: np.ndarray) -> None:
-    """Ensure each query point has at least one IN and one OUT shadow model."""
-    target_pool_global_indices = _build_target_pool_global_indices(cfg)
-    outside_pool = np.setdiff1d(
-        query_global_indices,
-        target_pool_global_indices,
-        assume_unique=False,
-    )
-    assert len(outside_pool) == 0, (
-        "Query set contains points outside shared pool D; "
-        f"found {len(outside_pool)} such points."
-    )
-
-    pool_size = len(target_pool_global_indices)
-    sorter = np.argsort(target_pool_global_indices)
-    sorted_globals = target_pool_global_indices[sorter]
-    pos = np.searchsorted(sorted_globals, query_global_indices)
-    assert np.all(sorted_globals[pos] == query_global_indices), (
-        "Failed to map some query points into shared pool D."
-    )
-    query_local_indices = sorter[pos]
-
-    n_shadow_models = int(cfg["n_shadow_models"])
-    in_size = int(cfg["pkeep"] * pool_size)
-    assert in_size > 0 and in_size < pool_size, (
-        f"Invalid shadow IN subset size {in_size} for pool size {pool_size}."
-    )
-
-    in_counts = np.zeros(len(query_local_indices), dtype=np.int32)
-    for shadow_id in range(n_shadow_models):
-        rs = np.random.RandomState(2025 + shadow_id)
-        shadow_in_local = rs.choice(pool_size, in_size, replace=False)
-        in_mask = np.zeros(pool_size, dtype=bool)
-        in_mask[shadow_in_local] = True
-        in_counts += in_mask[query_local_indices].astype(np.int32)
-
-    out_counts = n_shadow_models - in_counts
-    min_in = int(in_counts.min())
-    min_out = int(out_counts.min())
-    print(
-        "  Query IN/OUT shadow coverage: "
-        f"min_IN={min_in}, min_OUT={min_out}, "
-        f"avg_IN={in_counts.mean():.2f}, avg_OUT={out_counts.mean():.2f}"
-    )
-
-    assert min_in > 0, (
-        "At least one query point has 0 IN shadows, which invalidates LiRA IN-distribution fitting."
-    )
-    assert min_out > 0, (
-        "At least one query point has 0 OUT shadows, which invalidates LiRA OUT-distribution fitting."
-    )
-
-
-# ---------------------------------------------------------------------------
-# Target model evaluation on the query set
-# ---------------------------------------------------------------------------
-
-def _compute_target_lira_scores(exp_dir: str, cfg: dict,
-                                 query_global_indices: np.ndarray) -> np.ndarray:
-    """Evaluate the target model on D_query and return scaled logits.
-
-    Returns (n_query,) array of log(p_true / (1 - p_true)).
-
-    The loader iterates over query_global_indices in order so that output[i]
-    corresponds to query point i — the same ordering used by lira_stats,
-    C_lira, in_mask, and ground_truth.
-    """
-    from models.resnet import ResNet18_Influence
-    target_path = os.path.join(exp_dir, "target_model.pt")
-    if not os.path.exists(target_path):
-        raise FileNotFoundError(
-            f"Target model not found at {target_path}. Run train_target.py first."
-        )
-    assert os.path.basename(target_path) == "target_model.pt", (
-        "Target score computation must use target_model.pt."
-    )
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model  = ResNet18_Influence(num_classes=int(cfg["num_classes"])).to(device)
-    state_dict = torch.load(target_path, map_location=device, weights_only=False)
-    if "model_state_dict" in state_dict:
-        model.load_state_dict(state_dict["model_state_dict"])
-    else:
-        model.load_state_dict(state_dict)
-    model.eval()
-
-    mean = cfg["data_mean"]
-    std  = cfg["data_std"]
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean, std),
-    ])
-
-    train_ds = torchvision.datasets.CIFAR10(
-        root=cfg["data_dir"], train=True, download=False, transform=transform
-    )
-    test_ds = torchvision.datasets.CIFAR10(
-        root=cfg["data_dir"], train=False, download=False, transform=transform
-    )
-    full_dataset = ConcatDataset([train_ds, test_ds])
-
-    # Subset to the query points in query_indices order (no shuffling).
-    # query_indices are global indices over full_dataset.
-    query_ds = Subset(full_dataset, query_global_indices.tolist())
-    loader   = DataLoader(
-        query_ds,
-        batch_size=256,
-        shuffle=False,
-        drop_last=False,
-        num_workers=2,
-        pin_memory=(device.type == "cuda"),
-    )
-
-    scores = []
-    with torch.no_grad():
-        for inputs, targets in loader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            logits  = model(inputs)
-            probs   = torch.softmax(logits, dim=1)
-            p_true  = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
-            p_true  = torch.clamp(p_true, min=1e-7, max=1.0 - 1e-7)
-            scores.append(torch.log(p_true / (1.0 - p_true)).cpu().numpy())
-
-    result = np.concatenate(scores)
-    n_query = len(query_global_indices)
-    assert result.shape == (n_query,), (
-        f"Target score array shape {result.shape} != (n_query={n_query},). "
-        "Pool reconstruction or query_indices may be misaligned."
-    )
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Expected discrepancy MIA score
-# ---------------------------------------------------------------------------
-
-def _compute_mia_scores(lira_stats, target_scores: np.ndarray) -> np.ndarray:
-    """Per-point expected discrepancy attack scores.
-
-    mia_score[i] = target_score[i] - mean_k(shadow_score[k][i])
-
-    This measures how much more confident the target model is on point i
-    relative to the shadow models' average, without requiring IN/OUT Gaussian
-    fitting (invalid when shadow pools are disjoint from the query set).
-    """
-    shadow_mean = np.stack(lira_stats, axis=0).mean(axis=0)  # (N,)
-    return target_scores - shadow_mean
-
-
-def _aggregate_influence(C_list):
-    """Mean influence score across all shadows per query point."""
-    K = len(C_list)
-    return np.stack([C_list[k] for k in range(K)], axis=0).mean(axis=0)
-
-
-def _gmm_aggregate_mia_scores(
-    influence_scores: np.ndarray,
-    mia_scores: np.ndarray,
-    num_buckets: int = 10,
-    verbose: bool = True,
-) -> np.ndarray:
-    """Bucket-wise GMM aggregation using Log-Likelihood Ratios (LLR).
-
-    Returns a global LLR array that is comparable across all buckets:
-
-        LLR(x) = log p(s(x) | IN, bucket_b) - log p(s(x) | OUT, bucket_b)
-
-    By the Neyman-Pearson lemma this is the most powerful test statistic under
-    the GMM model.  It is scale-comparable across buckets regardless of their
-    variances, which eliminates the 0.5-flooding artefact of raw posteriors.
-
-    Unreliable buckets (flat GMMs, poor separation) produce LLR ≈ 0 so those
-    points settle near the middle of the global ranking — they do not flood the
-    low-FPR regime with false positives.
-
-    Buckets too small (< 10 points) fall back to centred rank scores so they
-    also contribute LLR-like values near 0 rather than random posteriors.
-    """
-    N = len(mia_scores)
-    llr_scores = np.zeros(N, dtype=float)  # default 0 = uninformative
-
-    quantiles  = np.quantile(influence_scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
-    bucket_ids = np.digitize(influence_scores, quantiles)
-
-    for b in range(num_buckets):
-        idx = np.where(bucket_ids == b)[0]
-        if len(idx) < 10:
-            # Too few points: centre ranks around 0 so they rank near the middle.
-            ranks = np.argsort(np.argsort(mia_scores[idx])).astype(float)
-            centred = ranks - (len(idx) - 1) / 2.0
-            llr_scores[idx] = centred / max((len(idx) - 1) / 2.0, 1.0)
-            continue
-
-        fit = fit_fixed_zero_rightshift_mixture(mia_scores[idx])
-        if verbose:
-            print(
-                f"  [Bucket {b}] n={len(idx)}: "
-                f"mu_in={fit['mu_in']:.3f}  "
-                f"sd_out={np.sqrt(fit['var_out']):.3f}  "
-                f"sd_in={np.sqrt(fit['var_in']):.3f}  "
-                f"pi_in={fit['pi_in']:.3f}  "
-                f"bhattacharyya={fit['bhattacharyya']:.3f}  "
-                f"reliable={fit['reliable']}  "
-                f"converged={fit['converged']}"
-            )
-        if not fit["reliable"]:
-            if verbose:
-                print(f"    -> unreliable: {fit['reason']} — LLR set to 0 (uninformative)")
-            # LLR already 0 for these indices; leave as-is.
-        else:
-            llr_scores[idx] = fit["llr"]
-
-    return llr_scores
-
-
-def _evaluate_attack_metrics(ground_truth: np.ndarray, scores: np.ndarray) -> dict:
-    fpr, tpr, _ = roc_curve(ground_truth.astype(int), scores)
-    return {
-        "tpr_0pct": _tpr_at_fpr(fpr, tpr, max_fpr=0.0),
-        "tpr_01pct": _tpr_at_fpr(fpr, tpr, max_fpr=0.001),
-        "tpr_1pct": _tpr_at_fpr(fpr, tpr, max_fpr=0.01),
-        "bal_acc": _balanced_accuracy_from_roc(fpr, tpr),
-    }
-
-
-def _adaptive_gmm_bucket_search(
-    ground_truth: np.ndarray,
-    mia_scores: np.ndarray,
-    influence_scores: np.ndarray,
-    min_buckets: int,
-    max_buckets: int,
-
-) -> tuple:
-    """Find strong loss-bucketing counts without a pure grid sweep.
-
-    Uses a staged search:
-      1) coarse candidate sampling over the full range,
-      2) local neighborhood refinement around top seeds,
-      3) fallback to full sweep only for very small ranges.
-
-    Returns (results, best_for_0pct, best_for_001pct, best_for_1pct), where
-    each best entry is a result dict containing bucket count, metrics, and
-    gmm probabilities.
-    """
-    n_query = len(mia_scores)
-    max_reasonable = max(2, min(max_buckets, n_query // 10))
-    min_reasonable = max(2, min(min_buckets, max_reasonable))
-
-    if min_reasonable > max_reasonable:
-        min_reasonable = max_reasonable
-
-    evaluated = {}
-
-    def _eval_bucket_count(num_buckets: int):
-        num_buckets = int(num_buckets)
-        if num_buckets in evaluated:
-            return evaluated[num_buckets]
-        gmm_probs = _gmm_aggregate_mia_scores(
-            influence_scores=influence_scores,
-            mia_scores=mia_scores,
-            num_buckets=num_buckets,
-            verbose=False,
-        )
-        metrics = _evaluate_attack_metrics(ground_truth, gmm_probs)
-        result = {
-            "num_buckets": num_buckets,
-            "metrics": metrics,
-            "gmm_probs": gmm_probs,
-        }
-        evaluated[num_buckets] = result
-        return result
-
-    search_span = max_reasonable - min_reasonable + 1
-
-    # For tiny ranges, exhaustive evaluation is cheap and stable.
-    if search_span <= 8:
-        for nb in range(min_reasonable, max_reasonable + 1):
-            _eval_bucket_count(nb)
-    else:
-        # Stage 1: coarse spread across the range.
-        coarse_points = np.linspace(min_reasonable, max_reasonable, num=8)
-        coarse_candidates = {int(round(v)) for v in coarse_points}
-        coarse_candidates.update({min_reasonable, max_reasonable})
-        for nb in sorted(coarse_candidates):
-            _eval_bucket_count(nb)
-
-        # Stage 2: local refinement near best coarse seeds.
-        def _key_0pct(res):
-            return (
-                res["metrics"]["tpr_0pct"],
-                res["metrics"]["tpr_01pct"],
-                res["metrics"]["tpr_1pct"],
-                res["metrics"]["bal_acc"],
-            )
-
-        def _key_001pct(res):
-            return (
-                res["metrics"]["tpr_01pct"],
-                res["metrics"]["tpr_1pct"],
-                res["metrics"]["tpr_0pct"],
-                res["metrics"]["bal_acc"],
-            )
-
-        def _key_1pct(res):
-            return (
-                res["metrics"]["tpr_1pct"],
-                res["metrics"]["tpr_01pct"],
-                res["metrics"]["tpr_0pct"],
-                res["metrics"]["bal_acc"],
-            )
-
-        coarse_results = list(evaluated.values())
-        seeds = set()
-        for res in sorted(coarse_results, key=_key_0pct, reverse=True)[:2]:
-            seeds.add(res["num_buckets"])
-        for res in sorted(coarse_results, key=_key_001pct, reverse=True)[:2]:
-            seeds.add(res["num_buckets"])
-
-        for seed in sorted(seeds):
-            for radius in (1, 2, 3):
-                for nb in (seed - radius, seed + radius):
-                    if min_reasonable <= nb <= max_reasonable:
-                        _eval_bucket_count(nb)
-
-        # Stage 3: if best candidate lies near boundaries, probe inward.
-        current_best_0 = max(evaluated.values(), key=lambda r: (
-            r["metrics"]["tpr_0pct"],
-            r["metrics"]["tpr_01pct"],
-            r["metrics"]["tpr_1pct"],
-            r["metrics"]["bal_acc"],
-        ))
-        current_best_001 = max(evaluated.values(), key=lambda r: (
-            r["metrics"]["tpr_01pct"],
-            r["metrics"]["tpr_1pct"],
-            r["metrics"]["tpr_0pct"],
-            r["metrics"]["bal_acc"],
-        ))
-        current_best_1 = max(evaluated.values(), key=lambda r: (
-            r["metrics"]["tpr_1pct"],
-            r["metrics"]["tpr_01pct"],
-            r["metrics"]["tpr_0pct"],
-            r["metrics"]["bal_acc"],
-        ))
-        edge_seeds = {
-            current_best_0["num_buckets"],
-            current_best_001["num_buckets"],
-            current_best_1["num_buckets"],
-        }
-        for seed in edge_seeds:
-            if seed <= min_reasonable + 1:
-                for nb in range(min_reasonable, min(min_reasonable + 5, max_reasonable + 1)):
-                    _eval_bucket_count(nb)
-            if seed >= max_reasonable - 1:
-                for nb in range(max(min_reasonable, max_reasonable - 4), max_reasonable + 1):
-                    _eval_bucket_count(nb)
-
-    all_results = [evaluated[k] for k in sorted(evaluated.keys())]
-
-    # Prefer higher target metric first, then stronger secondary target,
-    # then balanced accuracy as tie-breaker.
-    best_for_0pct = max(
-        all_results,
-        key=lambda r: (
-            r["metrics"]["tpr_0pct"],
-            r["metrics"]["tpr_01pct"],
-            r["metrics"]["tpr_1pct"],
-            r["metrics"]["bal_acc"],
-        ),
-    )
-    best_for_001pct = max(
-        all_results,
-        key=lambda r: (
-            r["metrics"]["tpr_01pct"],
-            r["metrics"]["tpr_1pct"],
-            r["metrics"]["tpr_0pct"],
-            r["metrics"]["bal_acc"],
-        ),
-    )
-    best_for_1pct = max(
-        all_results,
-        key=lambda r: (
-            r["metrics"]["tpr_1pct"],
-            r["metrics"]["tpr_01pct"],
-            r["metrics"]["tpr_0pct"],
-            r["metrics"]["bal_acc"],
-        ),
-    )
-
-    return all_results, best_for_0pct, best_for_001pct, best_for_1pct
-
-
-# ---------------------------------------------------------------------------
-# Metrics
-# ---------------------------------------------------------------------------
-
-def _balanced_accuracy_from_roc(fpr, tpr):
-    return float(((tpr + (1.0 - fpr)) / 2.0).max())
-
-
-def _tpr_at_fpr(fpr, tpr, max_fpr=0.01):
-    valid = np.where(fpr <= max_fpr)[0]
-    return float(tpr[valid[-1]]) if len(valid) > 0 else float("nan")
-
-
-# ---------------------------------------------------------------------------
-# Plots
-# ---------------------------------------------------------------------------
-
-def _plot_bucket_mia_hist(mia_scores, ground_truth, bucket_indices, bucket_id,
-                           out_dir, title_prefix):
-    fig, ax = plt.subplots(figsize=(6, 4))
-    idx_in  = bucket_indices[ground_truth[bucket_indices] == 1]
-    idx_out = bucket_indices[ground_truth[bucket_indices] == 0]
-    bins = np.linspace(mia_scores.min(), mia_scores.max(), 40)
-    ax.hist(mia_scores[idx_in],  bins=bins, alpha=0.6, label="member",     color="steelblue")
-    ax.hist(mia_scores[idx_out], bins=bins, alpha=0.6, label="non-member", color="tomato")
-    ax.set_title(f"{title_prefix} — bucket {bucket_id}")
-    ax.set_xlabel("MIA score (expected discrepancy)")
-    ax.set_ylabel("Count")
-    ax.legend()
-    fig.tight_layout()
-    fname = os.path.join(out_dir, f"hist_{title_prefix}_bucket{bucket_id}.png")
-    fig.savefig(fname, dpi=100)
-    plt.close(fig)
-
-
-def _plot_bucket_tpr_comparison(scores_dict, mia_scores, ground_truth, out_dir, num_buckets):
-    score_names = list(scores_dict.keys())
-    bucket_tprs = {name: [] for name in score_names}
-
-    ref_scores = next(iter(scores_dict.values()))
-    quantiles  = np.quantile(ref_scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
-    bucket_ids = np.digitize(ref_scores, quantiles)
-
-    for b in range(num_buckets):
-        idx = np.where(bucket_ids == b)[0]
-        if len(idx) < 10:
-            for name in score_names:
-                bucket_tprs[name].append(float("nan"))
-            continue
-        fpr, tpr, _ = roc_curve(ground_truth[idx], mia_scores[idx])
-        tpr_val = _tpr_at_fpr(fpr, tpr, max_fpr=0.01)
-        for name in score_names:
-            bucket_tprs[name].append(tpr_val * 100)
-
-    x     = np.arange(num_buckets)
-    width = 0.8 / max(len(score_names), 1)
-    fig, ax = plt.subplots(figsize=(10, 5))
-    for j, name in enumerate(score_names):
-        ax.bar(x + j * width, bucket_tprs[name], width, label=name, alpha=0.8)
-    ax.set_xlabel("Quintile bucket (by influence score)")
-    ax.set_ylabel("TPR @ 1% FPR (%)")
-    ax.set_title("MIA TPR@1%FPR by influence bucket")
-    ax.set_xticks(x + width * (len(score_names) - 1) / 2)
-    ax.set_xticklabels([f"Q{b}" for b in range(num_buckets)])
-    ax.legend()
-    fig.tight_layout()
-    fname = os.path.join(out_dir, "bucket_tpr_comparison.png")
-    fig.savefig(fname, dpi=100)
-    plt.close(fig)
-    print(f"  Saved bucket TPR comparison to {fname}")
-
-
-def _plot_score_vs_mia(score_name, scores, mia_scores, ground_truth, out_dir):
-    fig, ax = plt.subplots(figsize=(6, 5))
-    ax.scatter(scores[ground_truth == 0], mia_scores[ground_truth == 0],
-               s=2, alpha=0.3, color="tomato",    label="non-member")
-    ax.scatter(scores[ground_truth == 1], mia_scores[ground_truth == 1],
-               s=2, alpha=0.3, color="steelblue", label="member")
-    ax.set_xlabel(score_name)
-    ax.set_ylabel("MIA score (expected discrepancy)")
-    ax.set_title(f"{score_name} vs MIA score")
-    ax.legend(markerscale=4)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, f"scatter_{score_name}_vs_mia.png"), dpi=100)
-    plt.close(fig)
-
-
-def _plot_gmm_bucket_components(influence_scores, mia_scores, ground_truth, out_dir,
-                                num_buckets=10, min_points=10):
-    """Plot one fitted constrained mixture per influence bucket.
-
-    Each bucket plot shows histograms for members / non-members, the total
-    mixture density, the OUT component (mean fixed at 0), the IN component
-    (mean > 0), vertical lines at 0 and mu_in, and (optionally) the
-    posterior-equality threshold.  Unreliable fits are flagged in the title.
-    """
-    bucket_plot_dir = os.path.join(out_dir, "gmm_bucket_components")
-    os.makedirs(bucket_plot_dir, exist_ok=True)
-    csv_rows = []
-    quantiles = np.quantile(influence_scores, np.linspace(0, 1, num_buckets + 1)[1:-1])
-    bucket_ids = np.digitize(influence_scores, quantiles)
-
-    for b in range(num_buckets):
-        idx = np.where(bucket_ids == b)[0]
-        if len(idx) == 0:
-            continue
-
-        bucket_scores = mia_scores[idx]
-        bucket_members = ground_truth[idx] == 1
-        bucket_non_members = ~bucket_members
-        member_scores = bucket_scores[bucket_members]
-        non_member_scores = bucket_scores[bucket_non_members]
-
-        score_min = float(bucket_scores.min())
-        score_max = float(bucket_scores.max())
-        if np.isclose(score_min, score_max):
-            score_min -= 0.5
-            score_max += 0.5
-
-        # extend grid to comfortably show the zero-mean OUT component
-        grid_lo = min(score_min, -3.0 * np.sqrt(float(np.var(bucket_scores))))
-        grid_hi = max(score_max, 1.0)
-        x_grid = np.linspace(grid_lo, grid_hi, 400)
-
-        fig, ax = plt.subplots(figsize=(7.2, 4.8))
-
-        if len(idx) >= min_points:
-            fit = fit_fixed_zero_rightshift_mixture(bucket_scores)
-            thr_str = f"{fit['threshold']:.3f}" if fit["threshold"] is not None else "none"
-            print(
-                f"  [Bucket {b}] n={len(idx)}: "
-                f"mu_in={fit['mu_in']:.3f}  "
-                f"sd_out={np.sqrt(fit['var_out']):.3f}  "
-                f"sd_in={np.sqrt(fit['var_in']):.3f}  "
-                f"pi_in={fit['pi_in']:.3f}  "
-                f"bhattacharyya={fit['bhattacharyya']:.3f}  "
-                f"threshold={thr_str}  "
-                f"reliable={fit['reliable']}  converged={fit['converged']}"
-            )
-            if not fit["reliable"]:
-                print(f"    -> unreliable: {fit['reason']}")
-
-            # Permutation test: shuffle IN/OUT labels and recompute AUC to
-            # confirm that the real bucket AUC is genuinely above chance.
-            if len(bucket_members) >= 4 and bucket_members.sum() >= 2 and (~bucket_members).sum() >= 2:
-                from sklearn.metrics import roc_auc_score
-                try:
-                    real_auc = roc_auc_score(bucket_members.astype(int), fit["llr"])
-                    rng_perm = np.random.RandomState(42)
-                    perm_aucs = []
-                    for _ in range(200):
-                        shuffled = rng_perm.permutation(bucket_members.astype(int))
-                        perm_aucs.append(roc_auc_score(shuffled, fit["llr"]))
-                    perm_p = float(np.mean(np.array(perm_aucs) >= real_auc))
-                    print(
-                        f"    -> permutation test: real AUC={real_auc:.3f}  "
-                        f"perm mean={np.mean(perm_aucs):.3f}  p={perm_p:.3f}"
-                        + ("  [NO SIGNAL]" if perm_p > 0.1 else "")
-                    )
-                except Exception:
-                    pass
-
-            pdf_out   = fit["pi_out"] * norm.pdf(x_grid, 0.0, np.sqrt(fit["var_out"]))
-            pdf_in    = fit["pi_in"]  * norm.pdf(x_grid, fit["mu_in"], np.sqrt(fit["var_in"]))
-            total_pdf = pdf_out + pdf_in
-
-            p_in  = fit["posterior_in"]
-            p_out = fit["posterior_out"]
-            llr_vals = fit["llr"]
-        else:
-            fit       = None
-            total_pdf = None
-            pdf_out   = None
-            pdf_in    = None
-            p_in  = np.full(len(idx), np.nan, dtype=float)
-            p_out = np.full(len(idx), np.nan, dtype=float)
-            llr_vals = np.zeros(len(idx), dtype=float)
-            if len(idx) > 0:
-                ranks = np.argsort(np.argsort(bucket_scores)).astype(float)
-                p_in  = ranks / max(len(idx) - 1, 1)
-                p_out = 1.0 - p_in
-
-        predicted_is_in = llr_vals > 0.0
-
-        bins = np.linspace(score_min, score_max, 28)
-        ax.hist(non_member_scores, bins=bins, density=True, alpha=0.45,
-                color="tomato", label="out / non-member")
-        ax.hist(member_scores, bins=bins, density=True, alpha=0.45,
-                color="steelblue", label="in / member")
-
-        if total_pdf is not None:
-            ax.plot(x_grid, total_pdf, color="black",      linewidth=2.0, label="mixture total")
-            ax.plot(x_grid, pdf_out,   color="darkorange",  linewidth=1.8,
-                    linestyle="--", label=f"OUT  μ=0  σ={np.sqrt(fit['var_out']):.2f}")
-            ax.plot(x_grid, pdf_in,    color="purple",      linewidth=1.8,
-                    linestyle="--", label=f"IN   μ={fit['mu_in']:.2f}  σ={np.sqrt(fit['var_in']):.2f}")
-
-            ax.axvline(0.0,           color="darkorange", linestyle=":", linewidth=1.2)
-            ax.axvline(fit["mu_in"],  color="purple",     linestyle=":", linewidth=1.2)
-
-            if fit["threshold"] is not None:
-                ax.axvline(fit["threshold"], color="gray", linestyle="-.", linewidth=1.0,
-                           label=f"threshold={fit['threshold']:.2f}")
-
-            reliability_tag = "" if fit["reliable"] else f"  [UNRELIABLE: {fit['reason']}]"
-        else:
-            ax.text(0.5, 0.9, "Too few points for mixture", transform=ax.transAxes,
-                    ha="center", va="top", fontsize=9)
-            reliability_tag = ""
-
-        title = (
-            f"Bucket {b}  n={len(idx)}  "
-            f"in={int(bucket_members.sum())}  out={int(bucket_non_members.sum())}"
-            + reliability_tag
-        )
-        ax.set_title(title, fontsize=8 if reliability_tag else 10)
-        ax.set_xlabel("MIA score")
-        ax.set_ylabel("Density")
-        ax.legend(fontsize=8, loc="best")
-
-        fig.tight_layout()
-        out_path = os.path.join(bucket_plot_dir, f"bucket_{b:02d}_gmm_components.png")
-        fig.savefig(out_path, dpi=120)
-        plt.close(fig)
-
-        mu_in_val      = float(fit["mu_in"])           if fit else float("nan")
-        pi_in_val      = float(fit["pi_in"])           if fit else float("nan")
-        bhatta_val     = float(fit["bhattacharyya"])   if fit else float("nan")
-        reliable       = bool(fit["reliable"])         if fit else False
-        threshold      = fit["threshold"]              if fit else None
-        for local_pos, point_idx in enumerate(idx):
-            csv_rows.append({
-                "point_index":        int(point_idx),
-                "bucket":             int(b),
-                "bucket_size":        int(len(idx)),
-                "mu_in":              mu_in_val,
-                "pi_in":              pi_in_val,
-                "bhattacharyya":      bhatta_val,
-                "reliable":           reliable,
-                "threshold":          float(threshold) if threshold is not None else float("nan"),
-                "mia_score":          float(bucket_scores[local_pos]),
-                "llr":                float(llr_vals[local_pos]),
-                "ground_truth":       int(ground_truth[point_idx]),
-                "ground_truth_label": "in" if ground_truth[point_idx] == 1 else "out",
-                "predicted_label":    "in" if bool(predicted_is_in[local_pos]) else "out",
-                "p_in":               float(p_in[local_pos]),
-                "p_out":              float(p_out[local_pos]),
-            })
-
-    csv_rows.sort(key=lambda row: (row["bucket"], row["mia_score"], row["point_index"]))
-    csv_path = os.path.join(bucket_plot_dir, "bucket_points_sorted.csv")
-    with open(csv_path, "w", newline="") as csv_file:
-        writer = csv.DictWriter(
-            csv_file,
-            fieldnames=[
-                "point_index",
-                "bucket",
-                "bucket_size",
-                "mu_in",
-                "pi_in",
-                "bhattacharyya",
-                "reliable",
-                "threshold",
-                "mia_score",
-                "llr",
-                "ground_truth",
-                "ground_truth_label",
-                "predicted_label",
-                "p_in",
-                "p_out",
-            ],
-        )
-        writer.writeheader()
-        writer.writerows(csv_rows)
-
-    print(f"  Saved bucket-wise GMM component plots to {bucket_plot_dir}")
-    print(f"  Saved sorted bucket-point CSV to {csv_path}")
-
-
-# ---------------------------------------------------------------------------
-# Core analysis
-# ---------------------------------------------------------------------------
 
 def analyze_score(score_name, scores, mia_scores, ground_truth, out_dir, num_buckets=10):
     corr = np.corrcoef(scores, mia_scores)[0, 1]
@@ -982,34 +58,30 @@ def analyze_score(score_name, scores, mia_scores, ground_truth, out_dir, num_buc
             print(f"    Bucket {b}: too few points ({len(idx)}), skipping")
             continue
         fpr, tpr, _ = roc_curve(ground_truth[idx], mia_scores[idx])
-        tpr_0pct  = _tpr_at_fpr(fpr, tpr, max_fpr=0.0)
-        tpr_01pct = _tpr_at_fpr(fpr, tpr, max_fpr=0.001)
-        tpr_1pct  = _tpr_at_fpr(fpr, tpr, max_fpr=0.01)
-        bal_acc   = _balanced_accuracy_from_roc(fpr, tpr)
+        tpr_0pct  = tpr_at_fpr(fpr, tpr, max_fpr=0.0)
+        tpr_01pct = tpr_at_fpr(fpr, tpr, max_fpr=0.001)
+        tpr_1pct  = tpr_at_fpr(fpr, tpr, max_fpr=0.01)
+        bal_acc   = balanced_accuracy_from_roc(fpr, tpr)
         print(f"    Bucket {b}: size={len(idx):4d}, "
               f"TPR@0%FPR={tpr_0pct*100:5.2f}%, "
               f"TPR@0.1%FPR={tpr_01pct*100:5.2f}%, "
               f"TPR@1%FPR={tpr_1pct*100:5.2f}%, "
               f"Balanced Acc={bal_acc*100:5.2f}%")
-        _plot_bucket_mia_hist(mia_scores, ground_truth, idx, b, out_dir, score_name)
+        plot_bucket_mia_hist(mia_scores, ground_truth, idx, b, out_dir, score_name)
 
-    _plot_score_vs_mia(score_name, scores, mia_scores, ground_truth, out_dir)
+    plot_score_vs_mia(score_name, scores, mia_scores, ground_truth, out_dir)
 
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 def _parse_args():
     parser = argparse.ArgumentParser(description="Influence vs LiRA vulnerability analysis")
-    parser.add_argument("--dataset",     default="cifar10")
-    parser.add_argument("--exp_dir",     required=True,
+    parser.add_argument("--dataset",         default="cifar10")
+    parser.add_argument("--exp_dir",         required=True,
                         help="Experiment directory (e.g. outputs/<exp>/cifar10)")
-    parser.add_argument("--num_buckets", type=int, default=10,
+    parser.add_argument("--num_buckets",     type=int, default=10,
                         help="Number of quantile buckets (default: 5 = quintiles)")
     parser.add_argument("--min_gmm_buckets", type=int, default=4,
                         help="Minimum bucket count for adaptive GMM search")
-    parser.add_argument("--max_gmm_buckets", type=int, default=20,
+    parser.add_argument("--max_gmm_buckets", type=int, default=50,
                         help="Maximum bucket count for adaptive GMM search")
     return parser.parse_args()
 
@@ -1034,21 +106,21 @@ def run(
     print(f"Analysis output directory: {out_dir}")
 
     # ------------------------------------------------------------------
-    # 1. Query-set metadata — single source of truth for N and ground truth
+    # 1. Query-set metadata
     # ------------------------------------------------------------------
     print("\nLoading query metadata...")
-    query_global_indices, ground_truth = _load_query_metadata(exp_dir)
-    n_query  = len(query_global_indices)
-    members  = int(ground_truth.sum())
+    query_global_indices, ground_truth = load_query_metadata(exp_dir)
+    n_query    = len(query_global_indices)
+    members    = int(ground_truth.sum())
     nonmembers = int((ground_truth == 0).sum())
     print(f"  n_query={n_query}  members={members}  non-members={nonmembers}")
-    _assert_query_has_in_out_shadow_coverage(cfg, query_global_indices)
+    assert_query_has_in_out_shadow_coverage(cfg, query_global_indices)
 
     # ------------------------------------------------------------------
-    # 2. Shadow artifacts — all must have shape (n_query,)
+    # 2. Shadow artifacts
     # ------------------------------------------------------------------
     print(f"\nLoading {n_shadow_models} shadow models from {exp_dir}/shadows/...")
-    lira_stats, C_lira_list, C_loss_list = _load_shadow_data(
+    lira_stats, C_lira_list, C_loss_list = load_shadow_data(
         exp_dir,
         n_shadow_models,
         n_query=n_query,
@@ -1065,38 +137,34 @@ def run(
     # 3. Target model scores on D_query
     # ------------------------------------------------------------------
     print("\nEvaluating target model on query set...")
-    target_scores = _compute_target_lira_scores(exp_dir, cfg, query_global_indices)
+    target_scores = compute_target_lira_scores(exp_dir, cfg, query_global_indices)
     print(f"  target_scores: mean={target_scores.mean():.3f}, std={target_scores.std():.3f}")
 
     # ------------------------------------------------------------------
     # 4. Expected discrepancy MIA scores
     # ------------------------------------------------------------------
     print("\nComputing MIA scores (expected discrepancy)...")
-    mia_scores = _compute_mia_scores(lira_stats, target_scores)
+    mia_scores = compute_mia_scores(lira_stats, target_scores)
 
     fpr_all, tpr_all, _ = roc_curve(ground_truth.astype(int), mia_scores)
-    tpr_0pct_all  = _tpr_at_fpr(fpr_all, tpr_all, max_fpr=0.0)
-    tpr_01pct_all = _tpr_at_fpr(fpr_all, tpr_all, max_fpr=0.001)
-    tpr_1pct_all  = _tpr_at_fpr(fpr_all, tpr_all, max_fpr=0.01)
-    bal_acc_all   = _balanced_accuracy_from_roc(fpr_all, tpr_all)
+    tpr_0pct_all  = tpr_at_fpr(fpr_all, tpr_all, max_fpr=0.0)
+    tpr_01pct_all = tpr_at_fpr(fpr_all, tpr_all, max_fpr=0.001)
+    tpr_1pct_all  = tpr_at_fpr(fpr_all, tpr_all, max_fpr=0.01)
+    bal_acc_all   = balanced_accuracy_from_roc(fpr_all, tpr_all)
     print(f"  MIA global: TPR@0%FPR={tpr_0pct_all*100:.2f}%, "
-            f"TPR@0.1%FPR={tpr_01pct_all*100:.2f}%, "
+          f"TPR@0.1%FPR={tpr_01pct_all*100:.2f}%, "
           f"TPR@1%FPR={tpr_1pct_all*100:.2f}%, Balanced Acc={bal_acc_all*100:.2f}%")
 
-    # ------------------------------------------------------------------
-    # Outlier/variance hypothesis: check whether top-ranked IN members
-    # have anomalously high per-shadow score variance.  If the top-K
-    # IN members by raw MIA score are driven by lucky shadow variance
-    # outliers, their individual shadow scores will be highly dispersed.
-    # ------------------------------------------------------------------
-    shadow_matrix = np.stack(lira_stats, axis=0)  # (K, N)
-    per_point_var = shadow_matrix.var(axis=0)       # (N,)
-    top_k_check = min(20, int(ground_truth.sum()))
+    # Outlier/variance check
+    shadow_matrix = np.stack(lira_stats, axis=0)
+    per_point_var = shadow_matrix.var(axis=0)
+    top_k_check   = min(20, int(ground_truth.sum()))
     sorted_by_score = np.argsort(mia_scores)[::-1]
     top_k_in_idx = [i for i in sorted_by_score if ground_truth[i] == 1][:top_k_check]
-    rest_in_idx  = [i for i in range(len(ground_truth)) if ground_truth[i] == 1 and i not in set(top_k_in_idx)]
+    rest_in_idx  = [i for i in range(len(ground_truth))
+                    if ground_truth[i] == 1 and i not in set(top_k_in_idx)]
     if top_k_in_idx and rest_in_idx:
-        var_top = float(per_point_var[top_k_in_idx].mean())
+        var_top  = float(per_point_var[top_k_in_idx].mean())
         var_rest = float(per_point_var[rest_in_idx].mean())
         print(
             f"  [Variance check] Top-{top_k_check} IN members: "
@@ -1113,9 +181,9 @@ def run(
     # 5. Influence scores
     # ------------------------------------------------------------------
     print("\nAggregating influence scores across shadows...")
-    scores_C_lira = _aggregate_influence(C_lira_list)
+    scores_C_lira = aggregate_influence(C_lira_list)
     has_closs     = all(c is not None for c in C_loss_list)
-    scores_C_loss = _aggregate_influence(C_loss_list) if has_closs else None
+    scores_C_loss = aggregate_influence(C_loss_list) if has_closs else None
 
     scores_dict = {"C_lira": scores_C_lira}
     if scores_C_loss is not None:
@@ -1124,10 +192,10 @@ def run(
     for name, scores in scores_dict.items():
         analyze_score(name, scores, mia_scores, ground_truth, out_dir, num_buckets)
 
-    _plot_bucket_tpr_comparison(scores_dict, mia_scores, ground_truth, out_dir, num_buckets)
+    plot_bucket_tpr_comparison(scores_dict, mia_scores, ground_truth, out_dir, num_buckets)
 
     # ------------------------------------------------------------------
-    # 6. Adaptive bucket-wise GMM aggregation → global MIA
+    # 6. Adaptive bucket-wise GMM aggregation
     # ------------------------------------------------------------------
     print("\nRunning adaptive GMM bucket search...")
     if scores_C_loss is None:
@@ -1136,7 +204,7 @@ def run(
             "Re-run influence computation to produce C_loss.npy for all shadows."
         )
 
-    _all_gmm_results, best_0pct, best_001pct, best_1pct = _adaptive_gmm_bucket_search(
+    _all_gmm_results, best_0pct, best_001pct, best_1pct = adaptive_gmm_bucket_search(
         ground_truth=ground_truth,
         mia_scores=mia_scores,
         influence_scores=scores_C_loss,
@@ -1176,28 +244,24 @@ def run(
         f"TPR@1%FPR={best_1pct['metrics']['tpr_1pct']*100:.2f}%"
     )
 
-    gmm_probs_0pct = best_0pct["gmm_probs"]
+    gmm_probs_0pct   = best_0pct["gmm_probs"]
     gmm_probs_001pct = best_001pct["gmm_probs"]
 
-    # ------------------------------------------------------------------
-    # Precision@K sanity check on the best LLR scores.
-    # If LLR aggregation is working correctly, IN members should be
-    # concentrated at the top of the global ranking.
-    # Precision ≈ base_rate means the GMM component labels are wrong
-    # or the LLR values are inverted.
-    # ------------------------------------------------------------------
+    # Precision@K sanity check
     base_rate = float(ground_truth.mean())
-    llr_best = best_0pct["gmm_probs"]  # now contains LLR values
+    llr_best  = best_0pct["gmm_probs"]
     sorted_by_llr = np.argsort(llr_best)[::-1]
     sorted_labels = ground_truth[sorted_by_llr]
     print("\n  [Precision@K sanity check] (base rate = {:.3f})".format(base_rate))
     for k in [10, 50, 100]:
         if k <= len(sorted_labels):
             prec = float(sorted_labels[:k].mean())
-            flag = "  [OK]" if prec > base_rate * 1.5 else "  [WARNING: near base rate — check GMM component labels]"
+            flag = "  [OK]" if prec > base_rate * 1.5 else (
+                "  [WARNING: near base rate — check GMM component labels]"
+            )
             print(f"    Precision@{k:3d} = {prec:.3f}{flag}")
 
-    _plot_gmm_bucket_components(
+    plot_gmm_bucket_components(
         scores_C_loss,
         mia_scores,
         ground_truth,
@@ -1210,8 +274,6 @@ def run(
     # ------------------------------------------------------------------
     save_dict = dict(
         mia_scores=mia_scores,
-        # gmm_probs_* keys now contain LLR values (not posteriors).
-        # LLR = log p(s|IN) - log p(s|OUT) per bucket GMM — scale-comparable globally.
         gmm_probs_best_fpr0=gmm_probs_0pct,
         gmm_probs_best_fpr01=gmm_probs_001pct,
         ground_truth=ground_truth,
@@ -1224,10 +286,9 @@ def run(
         best_gmm_fpr1_score=np.array("C_loss"),
         best_gmm_fpr1_buckets=np.array(best_1pct["num_buckets"], dtype=np.int64),
     )
-    # Legacy aliases kept for backward compatibility with old readers.
-    save_dict["gmm_probs_best_fpr001"] = gmm_probs_001pct
-    save_dict["best_gmm_fpr001_score"] = np.array("C_loss")
-    save_dict["best_gmm_fpr001_buckets"] = np.array(best_001pct["num_buckets"], dtype=np.int64)
+    save_dict["gmm_probs_best_fpr001"]    = gmm_probs_001pct
+    save_dict["best_gmm_fpr001_score"]    = np.array("C_loss")
+    save_dict["best_gmm_fpr001_buckets"]  = np.array(best_001pct["num_buckets"], dtype=np.int64)
     if scores_C_loss is not None:
         save_dict["scores_C_loss"] = scores_C_loss
 
