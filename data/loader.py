@@ -20,6 +20,12 @@ def get_dataset(args):
         args.num_classes = 10
         args.in_channels = 1
         return torchvision.datasets.FashionMNIST
+    elif dataset_name == "cifar100":
+        args.data_mean = [0.5071, 0.4867, 0.4408]
+        args.data_std  = [0.2675, 0.2565, 0.2761]
+        args.num_classes = 100
+        args.in_channels = 3
+        return torchvision.datasets.CIFAR100
     else:  # cifar10
         args.data_mean = [0.4914, 0.4822, 0.4465]
         args.data_std  = [0.2023, 0.1994, 0.2010]
@@ -125,6 +131,25 @@ def load_dataset(args, data_type="target", use_augmentation=True, return_full=Fa
             root=args.data_dir, train=True, download=True, transform=transform
         )
         test_ds = ds_cls(
+            root=args.data_dir, train=False, download=True, transform=transform
+        )
+    elif dataset_name == "cifar100":
+        if data_type in ("target", "shadow") and use_augmentation:
+            transform = transforms.Compose([
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                normalize,
+            ])
+        else:
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                normalize,
+            ])
+        train_ds = torchvision.datasets.CIFAR100(
+            root=args.data_dir, train=True, download=True, transform=transform
+        )
+        test_ds = torchvision.datasets.CIFAR100(
             root=args.data_dir, train=False, download=True, transform=transform
         )
     else:  # cifar10
