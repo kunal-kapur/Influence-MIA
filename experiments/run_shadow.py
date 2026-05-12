@@ -50,6 +50,10 @@ def _make_exp_name(args) -> str:
     ]
     if hasattr(args, "pkeep"):
         parts.append(f"pk{args.pkeep}")
+    if hasattr(args, "target_train_size"):
+        parts.append(f"tts{args.target_train_size}")
+    if hasattr(args, "shadow_train_size"):
+        parts.append(f"sts{args.shadow_train_size}")
     if hasattr(args, "n_shadow_models"):
         parts.append(f"ns{args.n_shadow_models}")
     return "_".join(parts)

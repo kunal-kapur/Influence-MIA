@@ -20,11 +20,9 @@ import warnings
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torchvision
-import torchvision.transforms as transforms
-from torch.utils.data import ConcatDataset, DataLoader, Subset
+from torch.utils.data import DataLoader, Subset
 
-from data.loader import get_dataset, split_dataset_for_type
+from data.loader import get_dataset, load_dataset
 from models.resnet import ResNet18_Influence
 from utils.io import load_model, load_array, save_array
 
@@ -32,15 +30,6 @@ from utils.io import load_model, load_array, save_array
 # ---------------------------------------------------------------------------
 # Data helpers
 # ---------------------------------------------------------------------------
-
-def _get_torchvision_cls(args):
-    name = getattr(args, "dataset", "cifar10").lower()
-    if name == "mnist":
-        return torchvision.datasets.MNIST
-    elif name == "fmnist":
-        return torchvision.datasets.FashionMNIST
-    return torchvision.datasets.CIFAR10
-
 
 def _load_query_indices(exp_dir: str) -> np.ndarray:
     """Global dataset indices of the query set, shape (n_query,)."""
@@ -52,58 +41,6 @@ def _load_query_indices(exp_dir: str) -> np.ndarray:
         )
     return np.load(path).astype(np.int64)
 
-
-def _build_target_pool_no_aug(args):
-    """Load the shared target/shadow pool (D) with normalisation only."""
-    get_dataset(args)
-    ds_cls = _get_torchvision_cls(args)
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(args.data_mean, args.data_std),
-    ])
-    train_ds = ds_cls(root=args.data_dir, train=True,  download=True, transform=transform)
-    test_ds  = ds_cls(root=args.data_dir, train=False, download=True, transform=transform)
-    return split_dataset_for_type(
-        ConcatDataset([train_ds, test_ds]),
-        seed=args.seed,
-        data_type="target",
-        shared_pool_size=getattr(args, "shared_pool_size", None),
-    )
-
-
-def _build_full_eval_dataset_no_aug(args):
-    """Load full train+test with normalisation only."""
-    get_dataset(args)
-    ds_cls = _get_torchvision_cls(args)
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(args.data_mean, args.data_std),
-    ])
-    train_ds = ds_cls(root=args.data_dir, train=True,  download=True, transform=transform)
-    test_ds  = ds_cls(root=args.data_dir, train=False, download=True, transform=transform)
-    return ConcatDataset([train_ds, test_ds])
-
-
-def _build_shadow_pool_no_aug(args):
-    """Load the shared target/shadow pool with normalisation only.
-
-    Used to reconstruct the shadow model's actual training subset for the
-    Hessian computation — we must use the same pool the model trained on.
-    """
-    get_dataset(args)
-    ds_cls = _get_torchvision_cls(args)
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(args.data_mean, args.data_std),
-    ])
-    train_ds = ds_cls(root=args.data_dir, train=True,  download=True, transform=transform)
-    test_ds  = ds_cls(root=args.data_dir, train=False, download=True, transform=transform)
-    return split_dataset_for_type(
-        ConcatDataset([train_ds, test_ds]),
-        seed=args.seed,
-        data_type="target",
-        shared_pool_size=getattr(args, "shared_pool_size", None),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +247,7 @@ def compute_influence(args, shadow_id, device):
     # ------------------------------------------------------------------
     # 2. Full eval dataset (no aug) — for evaluating the shadow model on D_query
     # ------------------------------------------------------------------
-    full_eval_no_aug = _build_full_eval_dataset_no_aug(args)
+    full_eval_no_aug = load_dataset(args, use_augmentation=False, return_full=True)
 
     # Verify full dataset size matches what query_indices was built against
     assert len(full_eval_no_aug) >= query_pool_indices.max() + 1, (
@@ -334,7 +271,7 @@ def compute_influence(args, shadow_id, device):
     # ------------------------------------------------------------------
     # 4. Shadow pool (no aug) — needed for Hessian (shadow's training data)
     # ------------------------------------------------------------------
-    shadow_pool_no_aug  = _build_shadow_pool_no_aug(args)
+    shadow_pool_no_aug  = load_dataset(args, data_type="target", use_augmentation=False)
     shadow_pool_size    = len(shadow_pool_no_aug)
     shadow_pool_global_indices = np.asarray(shadow_pool_no_aug.indices, dtype=np.int64)
 
@@ -350,8 +287,13 @@ def compute_influence(args, shadow_id, device):
 
     # Reconstruct the same shadow training subset used in train_shadow
     np.random.seed(2025 + shadow_id)
+    if hasattr(args, "shadow_train_size") and args.shadow_train_size is not None:
+        num_shadow_train = args.shadow_train_size
+    else:
+        num_shadow_train = int(args.pkeep * shadow_pool_size)
+
     shadow_in_indices = np.random.choice(
-        shadow_pool_size, int(args.pkeep * shadow_pool_size), replace=False
+        shadow_pool_size, num_shadow_train, replace=False
     )
     train_dataset_size = len(shadow_in_indices)
 

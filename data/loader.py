@@ -32,8 +32,8 @@ def offline_data_split(dataset, seed, data_type):
     """
     Split the full dataset deterministically into four disjoint pools:
 
-      target     : n // 3        — candidate set D for target model
-      shadow     : n // 3        — auxiliary pool for shadow model training
+      target     : n // 2        — candidate set D for target model & shadow models
+      shadow     : n // 6        — (unused but kept for splitting integrity)
       validation : n // 12       — small held-out split
       reference  : remainder     — disjoint reference data
 
@@ -46,8 +46,8 @@ def offline_data_split(dataset, seed, data_type):
 
     n = len(dataset)
 
-    target_size     = n // 3          # 20 000
-    shadow_size     = n // 3          # 20 000
+    target_size     = n // 2          # 30 000
+    shadow_size     = n // 6          # 10 000
     validation_size = n // 12         #  5 000
     reference_size  = n - target_size - shadow_size - validation_size  # 15 000
 
@@ -94,12 +94,13 @@ def split_dataset_for_type(dataset, seed, data_type, shared_pool_size=None):
     return split
 
 
-def load_dataset(args, data_type="target"):
+def load_dataset(args, data_type="target", use_augmentation=True, return_full=False):
     """
     Load train+test data, apply transforms, and return the requested split.
 
-    Training splits (target, shadow) get data augmentation.
+    Training splits (target, shadow) get data augmentation if use_augmentation is True.
     Evaluation splits (validation, reference) get normalisation only.
+    If return_full is True, returns the un-split ConcatDataset.
     """
     mean = args.data_mean
     std  = args.data_std
@@ -109,7 +110,7 @@ def load_dataset(args, data_type="target"):
     if dataset_name in ("mnist", "fmnist"):
         ds_cls = (torchvision.datasets.MNIST if dataset_name == "mnist"
                   else torchvision.datasets.FashionMNIST)
-        if data_type in ("target", "shadow"):
+        if data_type in ("target", "shadow") and use_augmentation:
             transform = transforms.Compose([
                 transforms.RandomAffine(degrees=10, translate=(0.1, 0.1)),
                 transforms.ToTensor(),
@@ -127,7 +128,7 @@ def load_dataset(args, data_type="target"):
             root=args.data_dir, train=False, download=True, transform=transform
         )
     else:  # cifar10
-        if data_type in ("target", "shadow"):
+        if data_type in ("target", "shadow") and use_augmentation:
             transform = transforms.Compose([
                 transforms.RandomCrop(32, padding=4),
                 transforms.RandomHorizontalFlip(),
@@ -147,6 +148,9 @@ def load_dataset(args, data_type="target"):
         )
 
     full_dataset = ConcatDataset([train_ds, test_ds])
+    if return_full:
+        return full_dataset
+
     return split_dataset_for_type(
         full_dataset,
         seed=args.seed,

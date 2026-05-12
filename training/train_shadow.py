@@ -95,9 +95,14 @@ def train_shadow(args, shadow_id, device):
     # Shadow training uses its own 50/50 IN / OUT split over the shadow pool.
     np.random.seed(2025 + shadow_id)
     shadow_all = np.arange(shadow_pool_size)
+    if hasattr(args, "shadow_train_size") and args.shadow_train_size is not None:
+        num_shadow_train = args.shadow_train_size
+    else:
+        num_shadow_train = int(args.pkeep * shadow_pool_size)
+
     shadow_in_indices  = np.random.choice(
         shadow_all,
-        int(args.pkeep * shadow_pool_size),
+        num_shadow_train,
         replace=False,
     )
     shadow_out_indices = np.setdiff1d(shadow_all, shadow_in_indices)
@@ -229,17 +234,3 @@ def train_shadow(args, shadow_id, device):
     return None
 
 
-class _SkipSingleton:
-    """Wraps a DataLoader and skips batches of size 1."""
-
-    def __init__(self, loader):
-        self._loader = loader
-
-    def __iter__(self):
-        for batch in self._loader:
-            if batch[0].size(0) == 1:
-                continue
-            yield batch
-
-    def __len__(self):
-        return len(self._loader)

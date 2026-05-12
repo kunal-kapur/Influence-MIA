@@ -46,7 +46,10 @@ def train_target(args, device):
     # ------------------------------------------------------------------
     # 2. Split D into D_train (80 %) and D_nonmember (20 %)
     # ------------------------------------------------------------------
-    n_train = int(0.8 * pool_size)
+    if hasattr(args, "target_train_size") and args.target_train_size is not None:
+        n_train = args.target_train_size
+    else:
+        n_train = int(0.8 * pool_size)
     n_nonmember = pool_size - n_train
 
     generator = torch.Generator().manual_seed(args.seed)
@@ -65,16 +68,11 @@ def train_target(args, device):
     target_nonmember_global_indices = target_pool_global_indices[nonmember_pool_indices]
 
     # ------------------------------------------------------------------
-    # 3. Build a balanced query set D_query = D_a ∪ D_b in global index space.
-    #    D_a ⊂ D_train                  (member queries)
-    #    D_b ⊂ (D \ D_train)            (non-member queries inside shared pool D)
-    #    |D_a| = |D_b| = min(|D_train|, |D \ D_train|)
+    # 3. Build a query set D_query = D_train ∪ D_nonmember in global index space.
+    #    We use the ENTIRE shared pool as the query dataset.
     # ------------------------------------------------------------------
-    n_query_half = min(len(train_global_indices), len(target_nonmember_global_indices))
-
-    rng = np.random.default_rng(args.seed)
-    da_global_indices = rng.choice(train_global_indices, n_query_half, replace=False)
-    db_global_indices = rng.choice(target_nonmember_global_indices, n_query_half, replace=False)
+    da_global_indices = train_global_indices
+    db_global_indices = target_nonmember_global_indices
 
     # query_global_indices are full-dataset indices in fixed order:
     # [Da members ... Db non-members].
@@ -101,7 +99,7 @@ def train_target(args, device):
 
     # ground_truth[i] = 1 if query point i is a target member, else 0.
     ground_truth = np.zeros(n_query, dtype=np.int32)
-    ground_truth[:n_query_half] = 1  # first half are Da (members)
+    ground_truth[:len(da_global_indices)] = 1  # members
 
     # ------------------------------------------------------------------
     # 4. DataLoaders for training
@@ -198,7 +196,7 @@ def train_target(args, device):
         f"[target] Saved metadata:\n"
         f"  target_train_indices : {n_train} points (global indices)\n"
         f"  query_indices        : {n_query} points  "
-        f"({n_query_half} members + {n_query_half} in-pool non-members)\n"
+        f"({len(da_global_indices)} members + {len(db_global_indices)} in-pool non-members)\n"
         f"  ground_truth         : {ground_truth.sum()} members, "
         f"{(ground_truth == 0).sum()} non-members"
     )
