@@ -65,7 +65,7 @@ def _compute_last_layer_hessian(model, loader, device, damping=1e-4):
 
     H = (1/N) * Σ_i  P_cov_i ⊗ φ_i φ_i^T  +  damping * I
 
-    Returns H_inv  (D×D float32 tensor on device).
+    Returns H_inv  (D×D float32 tensor on CPU).
     """
     model.eval()
     num_classes  = model.linear.out_features
@@ -85,31 +85,60 @@ def _compute_last_layer_hessian(model, loader, device, damping=1e-4):
             probs   = torch.softmax(logits, dim=1)
 
             P_cov = torch.diag_embed(probs) - torch.einsum('bi,bj->bij', probs, probs)
-            H += torch.einsum('bij,bk,bl->ikjl', P_cov, phi_aug, phi_aug).reshape(D, D)
+            
+            # Compute blocks without allocating full DxD on GPU
+            outer_phi = torch.bmm(phi_aug.unsqueeze(2), phi_aug.unsqueeze(1))
+            for i in range(num_classes):
+                H_i_unreshaped = torch.einsum('bj,bkl->jkl', P_cov[:, i, :], outer_phi)
+                H_i = H_i_unreshaped.permute(1, 0, 2).reshape(num_features, D)
+                H[i*num_features : (i+1)*num_features, :] += H_i
+                del H_i_unreshaped
+                del H_i
+            del outer_phi
+
             N += bs
 
     H /= N
+    H = H.cpu()
     # Keep Hessian numerically symmetric before inversion.
-    H = 0.5 * (H + H.T)
+    # We do this efficiently to prevent a 3x 10.5 GB spike from H + H.T
+    H_T = H.T.clone()
+    H.add_(H_T).mul_(0.5)
+    del H_T
 
-    eye = torch.eye(D, device=device, dtype=torch.float32)
+    # Serialize H to disk to completely free it from CPU RAM during inversion
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False) as f:
+        H_tmp_path = f.name
+    torch.save(H, H_tmp_path)
+    del H  # Free 10.5 GB
+
     damping_candidates = [float(damping), float(damping) * 10.0, float(damping) * 100.0]
 
     for damp in damping_candidates:
-        H_damped = H + damp * eye
+        H_damped = torch.load(H_tmp_path)
+        H_damped.diagonal().add_(damp)
         try:
-            # Prefer Cholesky inverse for SPD matrices (more stable than raw inv).
+            # Prefer Cholesky inverse for SPD matrices
             chol = torch.linalg.cholesky(H_damped)
+            del H_damped  # immediately free 10.5 GB
+
             H_inv = torch.cholesky_inverse(chol)
+            del chol  # immediately free 10.5 GB
+
             if not torch.isfinite(H_inv).all():
+                del H_inv
                 raise RuntimeError("H_inv contains non-finite values")
             if damp != float(damping):
                 warnings.warn(
                     f"Hessian inversion required stronger damping={damp:.1e} "
                     f"(requested {float(damping):.1e})."
                 )
+            os.remove(H_tmp_path)
             return H_inv
         except RuntimeError:
+            if 'H_damped' in locals(): del H_damped
+            if 'chol' in locals(): del chol
             continue
 
     # Last-resort fallback: heavily damped pseudo-inverse.
@@ -118,8 +147,12 @@ def _compute_last_layer_hessian(model, loader, device, damping=1e-4):
         f"Falling back to pseudo-inverse with damping={fallback_damp:.1e}. "
         "Results may be less reliable; consider increasing Hessian sample size."
     )
-    H_fallback = H + fallback_damp * eye
-    return torch.linalg.pinv(H_fallback)
+    H_fallback = torch.load(H_tmp_path)
+    H_fallback.diagonal().add_(fallback_damp)
+    H_inv = torch.linalg.pinv(H_fallback)
+    del H_fallback
+    os.remove(H_tmp_path)
+    return H_inv
 
 
 def _artifacts_match_query_alignment(meta_path, query_indices, train_dataset_size):
@@ -146,15 +179,18 @@ def _artifacts_match_query_alignment(meta_path, query_indices, train_dataset_siz
 def _collect_gradients(model, loader, train_dataset_size, device):
     """Per-sample CE and LiRA gradients for every point in loader.
 
-    Returns (G_lira, G_loss) both (N, D) float32 on device.
+    Returns (G_lira, G_loss) both (N, D) float32 on CPU.
     """
     model.eval()
     num_classes  = model.linear.out_features
     num_features = model.linear.in_features + 1
     D = num_classes * num_features
 
-    G_lira_list, G_loss_list = [], []
+    N_total = len(loader.dataset)
+    G_loss = torch.empty((N_total, D), dtype=torch.float32, device='cpu')
+    G_lira = torch.empty((N_total, D), dtype=torch.float32, device='cpu')
 
+    idx = 0
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(device), y.to(device)
@@ -169,15 +205,12 @@ def _collect_gradients(model, loader, train_dataset_size, device):
             d_logits  = probs - y_onehot
             d_logits_lira = d_logits / (p_true - 1.0)
 
-            G_loss_list.append(
-                torch.einsum('nc,nf->ncf', d_logits,      phi_aug).reshape(bs, D)
-            )
-            G_lira_list.append(
-                torch.einsum('nc,nf->ncf', d_logits_lira, phi_aug).reshape(bs, D)
-            )
+            G_loss[idx:idx+bs] = torch.einsum('nc,nf->ncf', d_logits, phi_aug).reshape(bs, D).cpu()
+            G_lira[idx:idx+bs] = torch.einsum('nc,nf->ncf', d_logits_lira, phi_aug).reshape(bs, D).cpu()
+            idx += bs
 
-    G_loss = torch.cat(G_loss_list, dim=0) / train_dataset_size
-    G_lira = torch.cat(G_lira_list, dim=0) / train_dataset_size
+    G_loss.div_(train_dataset_size)
+    G_lira.div_(train_dataset_size)
     return G_lira, G_loss
 
 
@@ -190,10 +223,62 @@ def _compute_influence_matrices(model, loader, H_inv, train_dataset_size, device
     G_lira, G_loss = _collect_gradients(model, loader, train_dataset_size, device)
     N = G_lira.shape[0]
 
-    H_inv_Gl_T = H_inv @ G_loss.T           # (D, N)
-    C_lira = torch.linalg.norm(-(G_lira @ H_inv_Gl_T) / N, dim=0).cpu().numpy()
-    C_loss = torch.linalg.norm(-(G_loss @ H_inv_Gl_T) / N, dim=0).cpu().numpy()
-    return C_lira, C_loss
+    C_lira = torch.zeros(N, dtype=torch.float32)
+    C_loss = torch.zeros(N, dtype=torch.float32)
+
+    H_inv_gpu = None
+    if device.type == 'cuda':
+        try:
+            H_inv_gpu = H_inv.to(device)
+        except RuntimeError:
+            warnings.warn("Not enough VRAM for H_inv. Falling back to CPU ops.")
+            H_inv_gpu = None
+            torch.cuda.empty_cache()
+
+    chunk_size = 2000
+    sub_chunk = 5000
+
+    for i in range(0, N, chunk_size):
+        end = min(i + chunk_size, N)
+        
+        if H_inv_gpu is not None:
+            U_chunk = (G_loss[i:end].to(device) @ H_inv_gpu).cpu()
+        else:
+            U_chunk = G_loss[i:end] @ H_inv
+
+        M_chunk_lira = torch.zeros((N, end - i), dtype=torch.float32)
+        M_chunk_loss = torch.zeros((N, end - i), dtype=torch.float32)
+        
+        if device.type == 'cuda':
+            try:
+                U_chunk_gpu = U_chunk.T.to(device)
+                for j in range(0, N, sub_chunk):
+                    j_end = min(j + sub_chunk, N)
+                    M_chunk_lira[j:j_end] = (G_lira[j:j_end].to(device) @ U_chunk_gpu).cpu()
+                    M_chunk_loss[j:j_end] = (G_loss[j:j_end].to(device) @ U_chunk_gpu).cpu()
+                del U_chunk_gpu
+            except RuntimeError:
+                torch.cuda.empty_cache()
+                U_chunk_T = U_chunk.T
+                for j in range(0, N, sub_chunk):
+                    j_end = min(j + sub_chunk, N)
+                    M_chunk_lira[j:j_end] = G_lira[j:j_end] @ U_chunk_T
+                    M_chunk_loss[j:j_end] = G_loss[j:j_end] @ U_chunk_T
+        else:
+            U_chunk_T = U_chunk.T
+            for j in range(0, N, sub_chunk):
+                j_end = min(j + sub_chunk, N)
+                M_chunk_lira[j:j_end] = G_lira[j:j_end] @ U_chunk_T
+                M_chunk_loss[j:j_end] = G_loss[j:j_end] @ U_chunk_T
+
+        C_lira[i:end] = torch.linalg.norm(M_chunk_lira, dim=0) / N
+        C_loss[i:end] = torch.linalg.norm(M_chunk_loss, dim=0) / N
+
+    if H_inv_gpu is not None:
+        del H_inv_gpu
+        torch.cuda.empty_cache()
+
+    return C_lira.numpy(), C_loss.numpy()
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +429,7 @@ def compute_influence(args, shadow_id, device):
         cached = load_array(hinv_path)
         if cached.shape == (expected_D, expected_D):
             print(f"[shadow {shadow_id}] H_inv loaded from cache")
-            H_inv = torch.tensor(cached, dtype=torch.float32, device=device)
+            H_inv = torch.tensor(cached, dtype=torch.float32, device='cpu')
         else:
             print(f"[shadow {shadow_id}] H_inv shape {cached.shape} != expected "
                   f"({expected_D},{expected_D}) — recomputing.")
