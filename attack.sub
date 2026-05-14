@@ -13,7 +13,7 @@ echo "CUDA_VISIBLE_DEVICES is set to: $CUDA_VISIBLE_DEVICES"
 mkdir -p logs
 
 
-DATASET="cifar10"
+DATASET="cifar100"
 OUTPUT_DIR="/scratch/scholar/kapur16/data/outputs/"
 DEVICE="cuda"
 CUDA=0

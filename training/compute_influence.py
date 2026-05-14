@@ -154,8 +154,42 @@ def _compute_last_layer_hessian(model, loader, device, damping=1e-4):
     os.remove(H_tmp_path)
     return H_inv
 
+def _compute_last_layer_hessian_diag(model, loader, device, damping=1e-4):
+    """Diagonal of empirical Fisher Hessian on the last linear layer.
 
-def _artifacts_match_query_alignment(meta_path, query_indices, train_dataset_size):
+    Returns H_inv_diag (D,) float32 tensor on CPU.
+    """
+    model.eval()
+    num_classes = model.linear.out_features
+    num_features = model.linear.in_features + 1
+    D = num_classes * num_features
+
+    H_diag = torch.zeros(D, device=device, dtype=torch.float32)
+    N = 0
+
+    with torch.no_grad():
+        for x, _ in loader:
+            x = x.to(device)
+            bs = x.size(0)
+
+            phi_aug = _extract_features(model, x)
+            logits = phi_aug[:, :-1] @ model.linear.weight.T + model.linear.bias
+            probs = torch.softmax(logits, dim=1)
+
+            p_cov_diag = probs * (1.0 - probs)
+            phi_sq = phi_aug * phi_aug
+
+            block_diag = torch.einsum('bi,bf->if', p_cov_diag, phi_sq)
+            H_diag += block_diag.reshape(-1)
+            N += bs
+
+    H_diag /= N
+    H_diag = H_diag.cpu()
+    H_diag.add_(float(damping))
+    H_inv_diag = 1.0 / H_diag
+    return H_inv_diag
+
+def _artifacts_match_query_alignment(meta_path, query_indices, train_dataset_size, hessian_approx):
     """Check whether cached influence artifacts match current query alignment."""
     if not os.path.exists(meta_path):
         return False
@@ -163,10 +197,14 @@ def _artifacts_match_query_alignment(meta_path, query_indices, train_dataset_siz
         meta = np.load(meta_path)
         cached_q = meta["query_indices"].astype(np.int64)
         cached_train_size = int(meta["train_dataset_size"])
+        cached_hessian_approx = meta.get("hessian_approx")
+        if cached_hessian_approx is not None:
+            cached_hessian_approx = str(cached_hessian_approx)
         return (
             cached_train_size == int(train_dataset_size)
             and cached_q.shape == query_indices.shape
             and np.array_equal(cached_q, query_indices)
+            and (cached_hessian_approx is None or cached_hessian_approx == str(hessian_approx))
         )
     except Exception:
         return False
@@ -214,6 +252,26 @@ def _collect_gradients(model, loader, train_dataset_size, device):
     return G_lira, G_loss
 
 
+def _batch_gradients(model, x, y):
+    """Compute per-sample gradients for CE and LiRA for a single batch.
+
+    Returns (G_lira, G_loss) with shapes (bs, D) on the same device as x.
+    """
+    num_classes = model.linear.out_features
+    phi_aug = _extract_features(model, x)
+    logits = phi_aug[:, :-1] @ model.linear.weight.T + model.linear.bias
+    probs = torch.softmax(logits, dim=1)
+
+    p_true = probs.gather(1, y.unsqueeze(1)).clamp(1e-7, 1.0 - 1e-7)
+    y_onehot = F.one_hot(y, num_classes=num_classes).float()
+    d_logits = probs - y_onehot
+    d_logits_lira = d_logits / (p_true - 1.0)
+
+    G_loss = torch.einsum('nc,nf->ncf', d_logits, phi_aug).reshape(x.size(0), -1)
+    G_lira = torch.einsum('nc,nf->ncf', d_logits_lira, phi_aug).reshape(x.size(0), -1)
+    return G_lira, G_loss
+
+
 def _compute_influence_matrices(model, loader, H_inv, train_dataset_size, device):
     """Column norms of the N×N cross-influence matrices.
 
@@ -227,6 +285,7 @@ def _compute_influence_matrices(model, loader, H_inv, train_dataset_size, device
     C_loss = torch.zeros(N, dtype=torch.float32)
 
     H_inv_gpu = None
+    H_inv_is_diag = H_inv.ndim == 1
     if device.type == 'cuda':
         try:
             H_inv_gpu = H_inv.to(device)
@@ -242,9 +301,15 @@ def _compute_influence_matrices(model, loader, H_inv, train_dataset_size, device
         end = min(i + chunk_size, N)
         
         if H_inv_gpu is not None:
-            U_chunk = (G_loss[i:end].to(device) @ H_inv_gpu).cpu()
+            if H_inv_is_diag:
+                U_chunk = (G_loss[i:end].to(device) * H_inv_gpu).cpu()
+            else:
+                U_chunk = (G_loss[i:end].to(device) @ H_inv_gpu).cpu()
         else:
-            U_chunk = G_loss[i:end] @ H_inv
+            if H_inv_is_diag:
+                U_chunk = G_loss[i:end] * H_inv
+            else:
+                U_chunk = G_loss[i:end] @ H_inv
 
         M_chunk_lira = torch.zeros((N, end - i), dtype=torch.float32)
         M_chunk_loss = torch.zeros((N, end - i), dtype=torch.float32)
@@ -279,6 +344,113 @@ def _compute_influence_matrices(model, loader, H_inv, train_dataset_size, device
         torch.cuda.empty_cache()
 
     return C_lira.numpy(), C_loss.numpy()
+
+
+def _compute_influence_matrices_streaming(
+    model,
+    query_ds,
+    H_inv,
+    train_dataset_size,
+    device,
+    batch_size,
+    num_workers,
+):
+    """Memory-safe influence computation without storing full gradient matrices."""
+    model.eval()
+    N = len(query_ds)
+    D = (model.linear.in_features + 1) * model.linear.out_features
+
+    C_lira = np.zeros(N, dtype=np.float32)
+    C_loss = np.zeros(N, dtype=np.float32)
+
+    H_inv_is_diag = H_inv.ndim == 1
+    H_inv_gpu = None
+    if device.type == "cuda":
+        try:
+            H_inv_gpu = H_inv.to(device)
+        except RuntimeError:
+            warnings.warn("Not enough VRAM for H_inv. Falling back to CPU ops.")
+            H_inv_gpu = None
+            torch.cuda.empty_cache()
+
+    # Size chosen to keep U_chunk manageable: chunk * D * 4 bytes.
+    chunk_size = 512
+
+    row_loader = DataLoader(
+        query_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
+
+    for start in range(0, N, chunk_size):
+        end = min(start + chunk_size, N)
+        chunk_len = end - start
+        col_indices = list(range(start, end))
+        col_loader = DataLoader(
+            Subset(query_ds, col_indices),
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=num_workers,
+            pin_memory=(device.type == "cuda"),
+        )
+
+        # Build G_loss for this column chunk
+        G_loss_chunk = torch.empty((chunk_len, D), device=device, dtype=torch.float32)
+        idx = 0
+        with torch.no_grad():
+            for x, y in col_loader:
+                x, y = x.to(device), y.to(device)
+                _, G_loss = _batch_gradients(model, x, y)
+                bs = x.size(0)
+                G_loss_chunk[idx:idx+bs] = G_loss
+                idx += bs
+
+        G_loss_chunk.div_(train_dataset_size)
+
+        if H_inv_gpu is not None:
+            if H_inv_is_diag:
+                U_chunk = G_loss_chunk * H_inv_gpu
+            else:
+                U_chunk = G_loss_chunk @ H_inv_gpu
+        else:
+            G_loss_chunk_cpu = G_loss_chunk.cpu()
+            if H_inv_is_diag:
+                U_chunk = G_loss_chunk_cpu * H_inv
+            else:
+                U_chunk = G_loss_chunk_cpu @ H_inv
+            U_chunk = U_chunk.to(device)
+
+        sumsq_lira = torch.zeros(chunk_len, device=device, dtype=torch.float32)
+        sumsq_loss = torch.zeros(chunk_len, device=device, dtype=torch.float32)
+
+        with torch.no_grad():
+            for x, y in row_loader:
+                x, y = x.to(device), y.to(device)
+                G_lira, G_loss = _batch_gradients(model, x, y)
+                G_lira.div_(train_dataset_size)
+                G_loss.div_(train_dataset_size)
+
+                M_lira = G_lira @ U_chunk.T
+                M_loss = G_loss @ U_chunk.T
+                sumsq_lira += (M_lira * M_lira).sum(dim=0)
+                sumsq_loss += (M_loss * M_loss).sum(dim=0)
+
+        C_lira[start:end] = (torch.sqrt(sumsq_lira) / N).cpu().numpy()
+        C_loss[start:end] = (torch.sqrt(sumsq_loss) / N).cpu().numpy()
+
+        del G_loss_chunk, U_chunk, sumsq_lira, sumsq_loss
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    if H_inv_gpu is not None:
+        del H_inv_gpu
+        torch.cuda.empty_cache()
+
+    return C_lira, C_loss
 
 
 # ---------------------------------------------------------------------------
@@ -397,10 +569,12 @@ def compute_influence(args, shadow_id, device):
 
     print(f"[shadow {shadow_id}] Shadow training subset size: {train_dataset_size}")
 
+    hessian_approx = getattr(args, "hessian_approx", "full")
+
     # If query ordering or train subset size changed, force recomputation of
     # query-aligned artifacts to prevent silent index drift.
     has_valid_alignment_meta = _artifacts_match_query_alignment(
-        meta_path, query_pool_indices, train_dataset_size
+        meta_path, query_pool_indices, train_dataset_size, hessian_approx
     )
     if not has_valid_alignment_meta:
         for p in (clira_path, closs_path, lira_path):
@@ -427,8 +601,11 @@ def compute_influence(args, shadow_id, device):
     H_inv = None
     if os.path.exists(hinv_path) and has_valid_alignment_meta:
         cached = load_array(hinv_path)
-        if cached.shape == (expected_D, expected_D):
+        if cached.shape == (expected_D, expected_D) and hessian_approx == "full":
             print(f"[shadow {shadow_id}] H_inv loaded from cache")
+            H_inv = torch.tensor(cached, dtype=torch.float32, device='cpu')
+        elif cached.shape == (expected_D,) and hessian_approx == "diag":
+            print(f"[shadow {shadow_id}] H_inv diag loaded from cache")
             H_inv = torch.tensor(cached, dtype=torch.float32, device='cpu')
         else:
             print(f"[shadow {shadow_id}] H_inv shape {cached.shape} != expected "
@@ -453,10 +630,12 @@ def compute_influence(args, shadow_id, device):
             pin_memory=(device.type == "cuda"),
         )
         print(f"[shadow {shadow_id}] Computing Hessian on {hessian_sample} shadow-IN samples...")
-        H_inv = _compute_last_layer_hessian(model, hessian_loader, device, damping=1e-4)
+        if hessian_approx == "diag":
+            H_inv = _compute_last_layer_hessian_diag(model, hessian_loader, device, damping=1e-4)
+        else:
+            H_inv = _compute_last_layer_hessian(model, hessian_loader, device, damping=1e-4)
         save_array(H_inv.cpu().numpy(), hinv_path)
         print(f"[shadow {shadow_id}] H_inv saved  shape={H_inv.shape}")
-
     # ------------------------------------------------------------------
     # 7. Influence matrices — evaluated on the query set
     # ------------------------------------------------------------------
@@ -466,11 +645,23 @@ def compute_influence(args, shadow_id, device):
         C_loss = load_array(closs_path)
     else:
         print(f"[shadow {shadow_id}] Computing influence matrices over query set...")
-        C_lira, C_loss = _compute_influence_matrices(
-            model, query_loader, H_inv,
-            train_dataset_size=train_dataset_size,
-            device=device,
-        )
+        est_bytes = 2 * n_query * expected_D * 4
+        if est_bytes >= 2_000_000_000:
+            C_lira, C_loss = _compute_influence_matrices_streaming(
+                model,
+                query_ds,
+                H_inv,
+                train_dataset_size=train_dataset_size,
+                device=device,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+            )
+        else:
+            C_lira, C_loss = _compute_influence_matrices(
+                model, query_loader, H_inv,
+                train_dataset_size=train_dataset_size,
+                device=device,
+            )
         assert C_lira.shape == (n_query,), (
             f"[shadow {shadow_id}] C_lira shape {C_lira.shape} != (n_query={n_query},)"
         )
@@ -497,6 +688,7 @@ def compute_influence(args, shadow_id, device):
         meta_path,
         query_indices=query_pool_indices.astype(np.int64),
         train_dataset_size=np.array(train_dataset_size, dtype=np.int64),
+        hessian_approx=np.array(str(hessian_approx)),
     )
     print(f"[shadow {shadow_id}] alignment metadata saved: {meta_path}")
 
