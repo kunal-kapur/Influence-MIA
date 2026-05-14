@@ -122,9 +122,13 @@ class ResNet(nn.Module):
 
 
 def ResNet18(num_classes=10, in_channels=3):
+    if num_classes == 100:
+        return ResNet(BasicBlock, [3, 4, 6, 3], num_classes=num_classes, in_channels=in_channels)
     return ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, in_channels=in_channels)
 
 
 def ResNet18_Influence(num_classes=10, in_channels=3):
-    """ResNet18 configured for influence-function / MIA experiments."""
+    """ResNet configured for influence-function / MIA experiments."""
+    if num_classes == 100:
+        return ResNet(BasicBlock, [3, 4, 6, 3], num_classes=num_classes, in_channels=in_channels)
     return ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, in_channels=in_channels)
