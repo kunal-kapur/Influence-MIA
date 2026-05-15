@@ -281,8 +281,6 @@ class ResNet_Influence(nn.Module):
 
 
 def ResNet18_Influence(num_classes=10):
-    if num_classes == 100:
-        return ResNet_Influence(BasicBlock, [3, 4, 6, 3], num_classes=num_classes)
     return ResNet_Influence(BasicBlock, [2, 2, 2, 2], num_classes=num_classes)
 
 

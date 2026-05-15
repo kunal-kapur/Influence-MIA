@@ -52,10 +52,16 @@ def offline_data_split(dataset, seed, data_type):
 
     n = len(dataset)
 
-    target_size     = n // 2          # 30 000
-    shadow_size     = n // 6          # 10 000
-    validation_size = n // 12         #  5 000
-    reference_size  = n - target_size - shadow_size - validation_size  # 15 000
+    if n == 60000:
+        target_size     = 50000
+        shadow_size     = 0
+        validation_size = 10000
+        reference_size  = 0
+    else:
+        target_size     = n // 2          # 30 000
+        shadow_size     = n // 6          # 10 000
+        validation_size = n // 12         #  5 000
+        reference_size  = n - target_size - shadow_size - validation_size  # 15 000
 
     generator = torch.Generator().manual_seed(seed)
     target_split, shadow_split, validation_split, reference_split = random_split(
@@ -139,6 +145,7 @@ def load_dataset(args, data_type="target", use_augmentation=True, return_full=Fa
                 transforms.RandomCrop(32, padding=4),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
+                transforms.RandomErasing(p=0.5),
                 normalize,
             ])
         else:
